@@ -46,3 +46,16 @@ build/
 .DS_Store
 # 将 CODE_REVIEW md 文档添加到 .gitignore
 CODE_REVIEW_*.md
+
+# 会话/凭证（绝不能提交）
+*session*.json
+*session*.json.backup
+
+# 工具私有目录
+.ydevsphere/
+opencode/
+.kilocode/
+
+# 个人笔记
+about-me.md
+self-introduction.md

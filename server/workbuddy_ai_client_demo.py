@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Minimal CodeBuddy external-link-v2 client demo.
+"""Minimal WorkBuddy AI (overseas) external-link-v2 client demo.
 
-The protocol is extracted from Tencent Cloud CodeBuddy's VSIX.  This demo
-uses only the Python standard library and stores the session locally with
-0600 permissions.
+The protocol is identical to Tencent Cloud CodeBuddy's external-link-v2
+(cli-external-link).  This is a copy of codebuddy_client_demo.py pointed at the
+overseas WorkBuddy AI backend.
+
+Runtime backend endpoint for the overseas build is resolved via `/v3/config`
+and lands on https://www.codebuddy.ai (see externalDomain in product.json).
+Also exposes the SMH session host and the model API host for reference.
+
+This demo uses only the Python standard library and stores the session locally
+with 0600 permissions.
 """
 
 from __future__ import annotations
@@ -14,28 +21,43 @@ import os
 import pathlib
 import sys
 import time
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
 from typing import Any, Iterator
 
+try:
+    import certifi
+    _SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    _SSL_CONTEXT = ssl.create_default_context()
 
-class CodeBuddyError(RuntimeError):
+# Overseas WorkBuddy AI runtime values (from app.asar cli/product.json + /v3/config)
+PROD_ENDPOINT = "https://www.codebuddy.ai"
+PROD_ENDPOINT_ALIAS = "https://www.workbuddy.ai"
+STAGING_ENDPOINT = "https://staging-codebuddy.tencent.com"
+SMH_HOST_OVERSEAS = "https://smh38ewydmp37j7v.ap-singapore.api.tencentsmh.com"
+MODEL_API_HOST = "https://api.lkeap.cloud.tencent.com"
+AUTH_PLATFORM = "workbuddy-ai"  # product.json authentication.attributes.platform
+
+
+class WorkBuddyAIError(RuntimeError):
     pass
 
 
-class CodeBuddyClient:
+class WorkBuddyAIClient:
     def __init__(
         self,
-        endpoint: str = "https://copilot.tencent.com",
-        platform: str = "VSCode",
+        endpoint: str = PROD_ENDPOINT,
+        platform: str = AUTH_PLATFORM,
         session_file: pathlib.Path | None = None,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.platform = platform
         self.prefix = "/plugin"
-        self.session_file = session_file or pathlib.Path.home() / ".codebuddy-session.json"
+        self.session_file = session_file or pathlib.Path.home() / ".workbuddy-ai-session.json"
         self.session: dict[str, Any] = self._load_session()
 
     def _load_session(self) -> dict[str, Any]:
@@ -44,7 +66,7 @@ class CodeBuddyClient:
         except FileNotFoundError:
             return {}
         except (OSError, json.JSONDecodeError) as exc:
-            raise CodeBuddyError(f"无法读取 session 文件: {self.session_file}: {exc}") from exc
+            raise WorkBuddyAIError(f"无法读取 session 文件: {self.session_file}: {exc}") from exc
 
     def _save_session(self, session: dict[str, Any]) -> None:
         self.session_file.parent.mkdir(parents=True, exist_ok=True)
@@ -63,7 +85,6 @@ class CodeBuddyClient:
 
     @staticmethod
     def _unwrap(payload: Any) -> Any:
-        # CodeBuddy responses observed in the extension use {data: {data: ...}}.
         if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
             nested = payload["data"]
             if "data" in nested:
@@ -81,7 +102,7 @@ class CodeBuddyClient:
         body: Any = None,
         timeout: float = 30,
     ) -> Any:
-        request_headers = {"User-Agent": "CodeBuddyClientDemo/1.0"}
+        request_headers = {"User-Agent": "WorkBuddyAIClientDemo/1.0"}
         request_headers.update(headers or {})
         data = None
         if body is not None:
@@ -94,20 +115,20 @@ class CodeBuddyClient:
             method=method,
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urllib.request.urlopen(request, timeout=timeout, context=_SSL_CONTEXT) as response:
                 raw = response.read()
                 content_type = response.headers.get("Content-Type", "")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise CodeBuddyError(f"HTTP {exc.code} {path}: {detail[:1000]}") from exc
+            raise WorkBuddyAIError(f"HTTP {exc.code} {path}: {detail[:1000]}") from exc
         except urllib.error.URLError as exc:
-            raise CodeBuddyError(f"请求失败 {path}: {exc.reason}") from exc
+            raise WorkBuddyAIError(f"请求失败 {path}: {exc.reason}") from exc
         if "json" not in content_type and not raw:
             return None
         try:
             return json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
-            raise CodeBuddyError(f"{path} 返回的不是 JSON: {raw[:300]!r}") from exc
+            raise WorkBuddyAIError(f"{path} 返回的不是 JSON: {raw[:300]!r}") from exc
 
     def auth_headers(self, *, access: bool = True, refresh: bool = False) -> dict[str, str]:
         account = self.session.get("account") or {}
@@ -123,8 +144,6 @@ class CodeBuddyClient:
             headers["X-Enterprise-Id"] = str(account["enterpriseId"])
             headers["X-Tenant-Id"] = str(account["enterpriseId"])
         if auth.get("domain"):
-            # The extension calls this the domain header.  The server accepts
-            # X-Domain for the plugin protocol.
             headers["X-Domain"] = str(auth["domain"])
         return headers
 
@@ -144,11 +163,11 @@ class CodeBuddyClient:
             )
         )
         if not isinstance(state_payload, dict) or not state_payload.get("authUrl"):
-            raise CodeBuddyError(f"登录状态响应缺少 authUrl: {state_payload!r}")
+            raise WorkBuddyAIError(f"登录状态响应缺少 authUrl: {state_payload!r}")
         auth_url = str(state_payload["authUrl"])
         state = state_payload.get("state")
         if not state:
-            raise CodeBuddyError("登录状态响应缺少 state")
+            raise WorkBuddyAIError("登录状态响应缺少 state")
         print(f"请在浏览器中完成登录：\n{auth_url}")
         if open_browser:
             webbrowser.open(auth_url)
@@ -163,7 +182,7 @@ class CodeBuddyClient:
                         headers=no_auth,
                     )
                 )
-            except CodeBuddyError:
+            except WorkBuddyAIError:
                 continue
             if isinstance(token, dict) and token.get("accessToken"):
                 account = self._unwrap(
@@ -171,10 +190,6 @@ class CodeBuddyClient:
                         "GET",
                         f"/v2{self.prefix}/login/account?state={urllib.parse.quote(str(state))}",
                         headers={
-                            # The extension sends the bearer token here, but
-                            # only suppresses user/enterprise/department
-                            # headers; X-No-Authorization is not combined
-                            # with Authorization on this request.
                             "X-No-User-Id": "true",
                             "X-No-Enterprise-Id": "true",
                             "X-No-Department-Info": "true",
@@ -183,11 +198,11 @@ class CodeBuddyClient:
                     )
                 )
                 if not isinstance(account, dict):
-                    raise CodeBuddyError(f"登录账户响应格式异常: {account!r}")
+                    raise WorkBuddyAIError(f"登录账户响应格式异常: {account!r}")
                 self._save_session({"auth": token, "account": account})
                 print(f"登录成功，用户: {account.get('nickname') or account.get('uid', '<unknown>')}")
                 return
-        raise CodeBuddyError("登录超时")
+        raise WorkBuddyAIError("登录超时")
 
     @staticmethod
     def _token_headers(token: dict[str, Any]) -> dict[str, str]:
@@ -230,6 +245,17 @@ class CodeBuddyClient:
             return
         self.login(open_browser=open_browser)
 
+    def fetch_cloud_config(self) -> dict[str, Any]:
+        """拉取 /v3/config?repos= 云端产品配置（含 endpoint / models）。"""
+        self.ensure_authenticated()
+        payload = self._request(
+            "GET",
+            "/v3/config?repos=",
+            headers=self.auth_headers(),
+            timeout=30,
+        )
+        return self._unwrap(payload) if isinstance(payload, dict) else payload
+
     def stream_chat(
         self,
         prompt: str,
@@ -241,7 +267,8 @@ class CodeBuddyClient:
         self.ensure_authenticated()
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "system", "content": "You are a helpful assistant."},
+                         {"role": "user", "content": prompt}],
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": True,
@@ -257,7 +284,7 @@ class CodeBuddyClient:
             method="POST",
         )
         try:
-            response = urllib.request.urlopen(request, timeout=180)
+            response = urllib.request.urlopen(request, timeout=180, context=_SSL_CONTEXT)
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
             if exc.code == 401 and self.refresh():
@@ -265,7 +292,7 @@ class CodeBuddyClient:
                     prompt, model=model, temperature=temperature, max_tokens=max_tokens
                 )
                 return
-            raise CodeBuddyError(f"聊天请求 HTTP {exc.code}: {detail[:1000]}") from exc
+            raise WorkBuddyAIError(f"聊天请求 HTTP {exc.code}: {detail[:1000]}") from exc
         with response:
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()
@@ -286,16 +313,30 @@ class CodeBuddyClient:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CodeBuddy login/refresh/chat demo")
+    parser = argparse.ArgumentParser(description="WorkBuddy AI login/refresh/chat demo")
     parser.add_argument("prompt", nargs="?", help="要发送的问题")
-    parser.add_argument("--endpoint", default=os.getenv("CODEBUDDY_ENDPOINT", "https://copilot.tencent.com"))
-    parser.add_argument("--model", default=os.getenv("CODEBUDDY_MODEL", "default"))
+    parser.add_argument("--endpoint", default=os.getenv("WORKBUDDY_AI_ENDPOINT", PROD_ENDPOINT))
+    parser.add_argument("--staging", action="store_true", help="使用 staging endpoint")
+    parser.add_argument("--model", default=os.getenv("WORKBUDDY_AI_MODEL", "default"))
     parser.add_argument("--session-file", type=pathlib.Path)
     parser.add_argument("--no-browser", action="store_true", help="只打印登录 URL，不自动打开浏览器")
     parser.add_argument("--login", action="store_true", help="强制重新登录")
+    parser.add_argument("--config", action="store_true", help="拉取 /v3/config 云端配置")
     args = parser.parse_args()
-    client = CodeBuddyClient(args.endpoint, session_file=args.session_file)
+    if args.staging:
+        args.endpoint = STAGING_ENDPOINT
+    client = WorkBuddyAIClient(args.endpoint, session_file=args.session_file)
     try:
+        if args.config:
+            config = client.fetch_cloud_config()
+            ep = config.get("endpoint") or args.endpoint
+            print(f"endpoint: {ep}")
+            print(f"smhHost: {config.get('smhHost')}")
+            print("models:")
+            for m in config.get("models", []) or []:
+                if isinstance(m, dict):
+                    print("  ", m.get("id"), "|", m.get("name", ""))
+            return 0
         if args.login:
             client.login(open_browser=not args.no_browser)
         prompt = args.prompt or input("Prompt: ")
@@ -303,7 +344,7 @@ def main() -> int:
             print(text, end="", flush=True)
         print()
         return 0
-    except (CodeBuddyError, KeyboardInterrupt) as exc:
+    except (WorkBuddyAIError, KeyboardInterrupt) as exc:
         print(f"\n错误: {exc}", file=sys.stderr)
         return 1
 

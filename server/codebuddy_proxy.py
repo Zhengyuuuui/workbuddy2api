@@ -335,13 +335,55 @@ async def list_models():
     log_client_request("GET", "/v1/models", None)
     state.ensure_auth()
     
-    # 简化版：直接返回常用模型
-    models = [
-        {"id": "deepseek-v4-flash", "name": "DeepSeek V4 Flash", "vendor": "deepseek"},
-        {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
-        {"id": "deepseek-v4-pro", "name": "DeepSeek V4 Pro", "vendor": "deepseek"},
-        {"id": "auto", "name": "Auto", "vendor": "codebuddy"},
-    ]
+    endpoint = state.client.endpoint.lower()
+    overseas = (
+        "workbuddy" in endpoint
+        or "codebuddy.ai" in endpoint
+        or state.client.platform.lower() == "workbuddy-ai"
+    )
+    
+    if overseas:
+        # 海外 WorkBuddy AI 模型（权威：海外 product config，19 个，全部实测可用）
+        models = [
+            {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
+            {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
+            {"id": "balanced-model", "name": "Balanced", "vendor": "codebuddy"},
+            {"id": "primary-model", "name": "Primary", "vendor": "codebuddy"},
+            {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
+            {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
+            {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "vendor": "openai"},
+            {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "vendor": "openai"},
+            {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "vendor": "openai"},
+            {"id": "gpt-5.5", "name": "GPT-5.5", "vendor": "openai"},
+            {"id": "gpt-5.4", "name": "GPT-5.4", "vendor": "openai"},
+            {"id": "gpt-5.3-codex", "name": "GPT-5.3-Codex", "vendor": "openai"},
+            {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "vendor": "google"},
+            {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
+            {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
+            {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
+            {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
+            {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
+        ]
+    else:
+        # 国内 CodeBuddy 模型（app 实际可用列表 + kimi-k3-1，全部实测可用）
+        models = [
+            {"id": "auto", "name": "Auto", "vendor": "codebuddy"},
+            {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
+            {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
+            {"id": "glm-5.3-flash", "name": "GLM-5.3-flash", "vendor": "zhipu"},
+            {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
+            {"id": "glm-5.1", "name": "GLM-5.1", "vendor": "zhipu"},
+            {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "vendor": "zhipu"},
+            {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
+            {"id": "kimi-k3-1", "name": "Kimi-K3.1", "vendor": "moonshot"},
+            {"id": "kimi-k2.7", "name": "Kimi-K2.7-Code", "vendor": "moonshot"},
+            {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
+            {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
+            {"id": "deepseek-v4-flash", "name": "Deepseek-V4-Flash", "vendor": "deepseek"},
+            {"id": "deepseek-v4-pro", "name": "Deepseek-V4-Pro", "vendor": "deepseek"},
+        ]
     
     data = [
         {
@@ -431,6 +473,21 @@ async def forward_chat(
     
     stream = bool(body.get("stream"))
     upstream_body = dict(body)
+    
+    # 海外 WorkBuddy AI 要求首条消息必须是 system prompt
+    endpoint = state.client.endpoint.lower()
+    overseas = (
+        "workbuddy" in endpoint
+        or "codebuddy.ai" in endpoint
+        or state.client.platform.lower() == "workbuddy-ai"
+    )
+    if overseas:
+        messages = upstream_body.get("messages") or []
+        if not messages or messages[0].get("role") != "system":
+            upstream_body["messages"] = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                *messages,
+            ]
     
     # 限制 tools 数量防止上游拒绝 (CodeBuddy 限制约 30-50 个工具)
     original_tool_count = len(upstream_body.get("tools", []))
@@ -522,7 +579,7 @@ async def stream_upstream(
         # 异步HTTP客户端：timeout=None 依赖TCP超时
         # 使用合理的超时配置：连接超时30s，读取超时300s
         timeout_config = httpx.Timeout(30.0, read=300.0)
-        async with httpx.AsyncClient(timeout=timeout_config) as client:
+        async with httpx.AsyncClient(timeout=timeout_config, trust_env=False) as client:
             async with client.stream("POST", url, headers=headers, json=body) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
@@ -795,7 +852,7 @@ async def collect_upstream(
     try:
         # 使用合理的超时配置：连接超时30s，读取超时300s
         timeout_config = httpx.Timeout(30.0, read=300.0)
-        async with httpx.AsyncClient(timeout=timeout_config) as client:
+        async with httpx.AsyncClient(timeout=timeout_config, trust_env=False) as client:
             async with client.stream("POST", url, headers=headers, json=body) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
@@ -997,7 +1054,9 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.getenv("CODEBUDDY_PROXY_PORT", "8787")),
                         help="监听端口")
     parser.add_argument("--endpoint", default=os.getenv("CODEBUDDY_ENDPOINT", "https://copilot.tencent.com"),
-                        help="CodeBuddy 后端地址")
+                        help="CodeBuddy/WorkBuddy 后端地址")
+    parser.add_argument("--platform", default=os.getenv("CODEBUDDY_PLATFORM", "VSCode"),
+                        help="认证 platform 标识（国内 CodeBuddy 用 VSCode，海外 WorkBuddy AI 用 workbuddy-ai）")
     parser.add_argument("--session-file", type=pathlib.Path,
                         help="会话文件路径")
     parser.add_argument("--mock-dir", type=pathlib.Path,
@@ -1022,7 +1081,7 @@ def main():
     logger = setup_logging(log_dir)
     
     # 初始化客户端
-    client = CodeBuddyClient(args.endpoint, session_file=args.session_file)
+    client = CodeBuddyClient(args.endpoint, platform=args.platform, session_file=args.session_file)
     
     # 处理登录
     if args.login:
