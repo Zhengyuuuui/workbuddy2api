@@ -339,6 +339,7 @@ async def list_models():
     overseas = (
         "workbuddy" in endpoint
         or "codebuddy.ai" in endpoint
+        or "workbuddy.ai" in endpoint
         or state.client.platform.lower() == "workbuddy-ai"
     )
     
@@ -483,6 +484,7 @@ async def forward_chat(
     overseas = (
         "workbuddy" in endpoint
         or "codebuddy.ai" in endpoint
+        or "workbuddy.ai" in endpoint
         or state.client.platform.lower() == "workbuddy-ai"
     )
     if overseas:

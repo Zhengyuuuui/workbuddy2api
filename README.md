@@ -5,7 +5,7 @@
 **同一个 proxy，两个平台，一套模型池：**
 
 - 🇨🇳 **国内 CodeBuddy**（`copilot.tencent.com`）→ GLM-5.3、DeepSeek-V4、Kimi-K3、MiniMax-M3、混元 Hy4 等**国产模型**
-- 🌍 **海外 WorkBuddy AI**（`www.codebuddy.ai`）→ **GPT-5.6-Sol/Terra/Luna、GPT-5.5、GPT-5.4、GPT-5.3-Codex、Gemini-3.5-Flash** 等海外模型，外加 GLM / Kimi / 混元
+- 🌍 **海外 WorkBuddy AI**（`www.workbuddy.ai`）→ **GPT-5.6-Sol/Terra/Luna、GPT-5.5、GPT-5.4、GPT-5.3-Codex、Gemini-3.5-Flash** 等海外模型，外加 GLM / Kimi / 混元
 
 两个平台使用**完全相同的认证协议**，因此本项目复用同一套代码，启动参数一键切换。
 国内跑不了的 GPT / Gemini 系列，走海外端口即可使用。
@@ -17,7 +17,7 @@
 | | 国内版 CodeBuddy | 海外版 WorkBuddy AI |
 |---|---|---|
 | **产品** | CodeBuddy（腾讯云国内） | WorkBuddy AI（腾讯海外） |
-| **后端 Endpoint** | `https://copilot.tencent.com` | `https://www.codebuddy.ai` |
+| **后端 Endpoint** | `https://copilot.tencent.com` | `https://www.workbuddy.ai` |
 | **认证 platform** | `VSCode` | `workbuddy-ai` |
 | **Session 文件** | `~/.codebuddy-session.json` | `~/.workbuddy-ai-session.json` |
 | **默认端口** | `8787` | `8788`（自定义） |
@@ -71,6 +71,16 @@ uv run server/codebuddy_proxy.py
 
 所有命令均在 `server/` 目录下执行（或用 `uv run server/codebuddy_proxy.py` 从根目录执行）。
 
+### 登录信息
+
+| | 国内版 CodeBuddy | 海外版 WorkBuddy AI |
+|---|---|---|
+| **登录 URL** | `https://copilot.tencent.com/login?platform=VSCode&state={state}` | `https://www.workbuddy.ai/login?platform=workbuddy-ai&state={state}` |
+| **Session 文件** | `~/.codebuddy-session.json` | `~/.workbuddy-ai-session.json` |
+| **认证 platform** | `VSCode` | `workbuddy-ai` |
+
+> 登录流程：proxy 启动时会自动获取 `state` 并打开浏览器，用户完成登录后 token 自动保存到 session 文件。
+
 ### 1. 国内版 CodeBuddy（端口 8787）
 
 ```bash
@@ -92,14 +102,14 @@ cd server
 
 # 首次使用（浏览器登录）
 uv run codebuddy_proxy.py --port 8788 \
-  --endpoint https://www.codebuddy.ai \
+  --endpoint https://www.workbuddy.ai \
   --platform workbuddy-ai \
   --session-file ~/.workbuddy-ai-session.json \
   --login
 
 # 日常使用
 uv run codebuddy_proxy.py --port 8788 \
-  --endpoint https://www.codebuddy.ai \
+  --endpoint https://www.workbuddy.ai \
   --platform workbuddy-ai \
   --session-file ~/.workbuddy-ai-session.json \
   --log-file logs/proxy-intl.jsonl
@@ -213,7 +223,7 @@ model_provider = "codebuddy"
 ```bash
 --host HOST              监听地址（默认 127.0.0.1）
 --port PORT              监听端口（默认 8787）
---endpoint ENDPOINT      后端地址（国内默认 copilot.tencent.com，海外用 www.codebuddy.ai）
+--endpoint ENDPOINT      后端地址（国内默认 copilot.tencent.com，海外用 www.workbuddy.ai）
 --platform PLATFORM      认证 platform（国内 VSCode，海外 workbuddy-ai）
 --session-file PATH      会话文件路径
 --log-file PATH          JSONL 日志文件
@@ -374,7 +384,7 @@ tail -100 logs/codebuddy-proxy.jsonl | jq 'select(.event | startswith("stream"))
 uv run codebuddy_proxy.py --login
 
 # 海外
-uv run codebuddy_proxy.py --port 8788 --endpoint https://www.codebuddy.ai --platform workbuddy-ai --session-file ~/.workbuddy-ai-session.json --login
+uv run codebuddy_proxy.py --port 8788 --endpoint https://www.workbuddy.ai --platform workbuddy-ai --session-file ~/.workbuddy-ai-session.json --login
 ```
 
 ### 端口被占用
