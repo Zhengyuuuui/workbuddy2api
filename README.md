@@ -158,25 +158,37 @@ model_provider = "codebuddy"
 
 ## 模型列表
 
-### 国内版 CodeBuddy（15 个）
+### 国内版 CodeBuddy（27 个）
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
 | `auto` | Auto | codebuddy |
+| `default` | Default | codebuddy |
 | `hy4-preview` | Hy4 preview | tencent |
 | `hy3` | Hy3 | tencent |
+| `hunyuan-chat` | Hunyuan-Turbos | tencent |
 | `glm-5.3` | GLM-5.3 | zhipu |
 | `glm-5.3-flash` | GLM-5.3-flash | zhipu |
 | `glm-5.2` | GLM-5.2 | zhipu |
 | `glm-5.1` | GLM-5.1 | zhipu |
+| `glm-5.0` | GLM-5.0 | zhipu |
+| `glm-5.0-turbo` | GLM-5.0-Turbo | zhipu |
 | `glm-5v-turbo` | GLM-5v-Turbo | zhipu |
+| `glm-4.7` | GLM-4.7 | zhipu |
+| `glm-4.6` | GLM-4.6 | zhipu |
+| `glm-4.6v` | GLM-4.6V | zhipu |
 | `kimi-k3` | Kimi-K3 | moonshot |
 | `kimi-k3-1` | Kimi-K3.1（未公开发布） | moonshot |
 | `kimi-k2.7` | Kimi-K2.7-Code | moonshot |
 | `kimi-k2.6` | Kimi-K2.6 | moonshot |
+| `kimi-k2.5` | Kimi-K2.5 | moonshot |
+| `kimi-k2-thinking` | Kimi-K2-Thinking | moonshot |
 | `minimax-m3` | MiniMax-M3 | minimax |
-| `deepseek-v4-flash` | Deepseek-V4-Flash | deepseek |
+| `minimax-m2.7` | MiniMax-M2.7 | minimax |
+| `minimax-m2.5` | MiniMax-M2.5 | minimax |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | deepseek |
+| `deepseek-v4-flash` | Deepseek-V4-Flash | deepseek |
+| `deepseek-v3-2-volc` | DeepSeek-V3.2 | deepseek |
 
 ### 海外版 WorkBuddy AI（19 个）
 

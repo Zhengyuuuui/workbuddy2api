@@ -366,23 +366,35 @@ async def list_models():
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
         ]
     else:
-        # 国内 CodeBuddy 模型（app 实际可用列表 + kimi-k3-1，全部实测可用）
+        # 国内 CodeBuddy 模型（产品配置 + 实测补充，共 27 个）
         models = [
             {"id": "auto", "name": "Auto", "vendor": "codebuddy"},
+            {"id": "default", "name": "Default", "vendor": "codebuddy"},
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
+            {"id": "hunyuan-chat", "name": "Hunyuan-Turbos", "vendor": "tencent"},
             {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
             {"id": "glm-5.3-flash", "name": "GLM-5.3-flash", "vendor": "zhipu"},
             {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
             {"id": "glm-5.1", "name": "GLM-5.1", "vendor": "zhipu"},
+            {"id": "glm-5.0", "name": "GLM-5.0", "vendor": "zhipu"},
+            {"id": "glm-5.0-turbo", "name": "GLM-5.0-Turbo", "vendor": "zhipu"},
             {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "vendor": "zhipu"},
+            {"id": "glm-4.7", "name": "GLM-4.7", "vendor": "zhipu"},
+            {"id": "glm-4.6", "name": "GLM-4.6", "vendor": "zhipu"},
+            {"id": "glm-4.6v", "name": "GLM-4.6V", "vendor": "zhipu"},
             {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
             {"id": "kimi-k3-1", "name": "Kimi-K3.1", "vendor": "moonshot"},
             {"id": "kimi-k2.7", "name": "Kimi-K2.7-Code", "vendor": "moonshot"},
             {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
+            {"id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "moonshot"},
+            {"id": "kimi-k2-thinking", "name": "Kimi-K2-Thinking", "vendor": "moonshot"},
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
-            {"id": "deepseek-v4-flash", "name": "Deepseek-V4-Flash", "vendor": "deepseek"},
+            {"id": "minimax-m2.7", "name": "MiniMax-M2.7", "vendor": "minimax"},
+            {"id": "minimax-m2.5", "name": "MiniMax-M2.5", "vendor": "minimax"},
             {"id": "deepseek-v4-pro", "name": "Deepseek-V4-Pro", "vendor": "deepseek"},
+            {"id": "deepseek-v4-flash", "name": "Deepseek-V4-Flash", "vendor": "deepseek"},
+            {"id": "deepseek-v3-2-volc", "name": "DeepSeek-V3.2", "vendor": "deepseek"},
         ]
     
     data = [
