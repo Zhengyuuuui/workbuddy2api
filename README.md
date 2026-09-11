@@ -192,7 +192,7 @@ model_provider = "codebuddy"
 | `deepseek-v4-flash` | Deepseek-V4-Flash | deepseek |
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
 
-### 海外版 WorkBuddy AI（19 个）
+### 海外版 WorkBuddy AI（21 个）
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
@@ -214,7 +214,9 @@ model_provider = "codebuddy"
 | `glm-5.2` | GLM-5.2 | zhipu |
 | `kimi-k3` | Kimi-K3 | moonshot |
 | `kimi-k2.6` | Kimi-K2.6 | moonshot |
+| `kimi-k2.5` | Kimi-K2.5 | moonshot |
 | `minimax-m3` | MiniMax-M3 | minimax |
+| `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
 
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
 

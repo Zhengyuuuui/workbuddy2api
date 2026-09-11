@@ -344,7 +344,7 @@ async def list_models():
     )
     
     if overseas:
-        # 海外 WorkBuddy AI 模型（权威：海外 product config，19 个，全部实测可用）
+        # 海外 WorkBuddy AI 模型（实测可用，共 21 个）
         models = [
             {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
             {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
@@ -364,7 +364,9 @@ async def list_models():
             {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
             {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
             {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
+            {"id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "moonshot"},
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
+            {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
         ]
     else:
         # 国内 CodeBuddy 模型（产品配置 + 实测补充，共 27 个）
