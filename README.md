@@ -1,5 +1,7 @@
 # WorkBuddy2API
 
+> WorkBuddy 国际国内多账号反代网关 — 双域独立路由与切换、稳定设备指纹防风控、国内成长任务全自动完成、后台定时调度器、Web监控看板，支持 Codex / Claude Code / DSH 与标准 OpenAI 客户端。
+
 > 一个轻量级的本地 API 代理服务，将腾讯 **CodeBuddy（国内版）** 与 **WorkBuddy AI（海外版）** 的底层接口转换为标准的 OpenAI、Anthropic 和 Responses 协议格式。
 
 **同一个 proxy，两个平台，一套模型池：**
@@ -46,14 +48,18 @@ workbuddy2api/
 
 ## ✨ 核心特性
 
-- **双平台支持** - 国内 CodeBuddy 与海外 WorkBuddy AI 一键切换
-- **协议转换** - 支持 OpenAI Chat Completions、Anthropic Messages API 和 Responses 三种标准格式
+- **双域独立路由与切换** - 国内 CodeBuddy 与海外 WorkBuddy AI 一键切换，独立路由互不干扰
+- **官方 IDE 指纹伪装（防风控）** - 请求完整对齐官方 CodeBuddyIDE 客户端特征：UA/x-ide-*/x-product-*/会话 ID 链/b3 追踪链/previous_response_id 延续/device-token 接口，消费记录归因 `CodeBuddyIDE` 而非匿名 "-"
+- **稳定设备指纹防风控** - 会话级 conversation_id 复用 + 同会话 b3 traceid 延续 + 响应 id 链式传递，行为画像对齐真实 IDE 使用
+- **协议转换** - 支持 OpenAI Chat Completions、Anthropic Messages API 和 Responses 三种标准格式，兼容 Codex / Claude Code / DSH 等主流客户端
 - **脱敏处理** - 内置智能脱敏模块，自动过滤敏感信息（账号、密码、密钥、品牌词、路径等），有效缓解审核误拦
 - **消息压缩** - 智能压缩历史消息，大幅降低 token 使用量（适用于 Codex CLI 等长上下文场景）
 - **工具调用支持** - 完整支持 function calling 和 tool use 特性
 - **DSML 解析** - 自动识别和转换 DSML 格式的工具调用
 - **流式响应** - 支持 SSE 流式输出，实时返回生成内容
 - **多账号管理** - 支持多个登录态隔离，方便工作/个人账号切换
+- **国内成长任务自动化** - 签到等成长任务全自动完成（规划中）
+- **后台定时调度器 / Web 监控看板** - 额度监控、任务调度、状态可视化（规划中）
 
 ## 安装
 
