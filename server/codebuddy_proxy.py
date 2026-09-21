@@ -82,6 +82,20 @@ except ImportError:
         raise RuntimeError("anthropic_adapter not available - cannot convert /v1/messages requests")
     AnthropicStreamConverter = None
 
+# x-device-token 提取器（P1：官方 IDE 指纹设备令牌）
+try:
+    from extract_device_token import (
+        coerce_token_value as _coerce_token_value,
+        find_device_token as _find_device_token,
+    )
+    HAS_DEVICE_TOKEN_EXTRACTOR = True
+except ImportError:
+    HAS_DEVICE_TOKEN_EXTRACTOR = False
+    def _coerce_token_value(raw):
+        return raw.strip() if isinstance(raw, str) and raw.strip() else None
+    def _find_device_token(**kwargs):
+        return None
+
 
 # ============================================================================
 # 日志配置
@@ -131,6 +145,7 @@ class ProxyState:
         enable_optimize_context: bool = False,
         verbose_llm: bool = False,
         logger: logging.Logger | None = None,
+        device_token: str | None = None,
     ):
         self.client = client
         self.mock_dir = mock_dir
@@ -140,8 +155,14 @@ class ProxyState:
         self.verbose_llm = verbose_llm
         self.logger = logger
         self.started_at = time.time()
+        # 官方 IDE 设备指纹令牌（x-device-token）；None 表示不发送该头
+        self.device_token = device_token
         # 客户端会话键（body 轻量指纹）→ conversation_id，模拟 IDE 会话链路
         self._conversations: dict[str, str] = {}
+        # conv_id → 上一轮上游响应 id（previous_response_id 会话延续）
+        self._last_response_id: dict[str, str] = {}
+        # conv_id → (traceid, 递增计数)：同会话复用 b3 traceid
+        self._trace_ids: dict[str, tuple[str, int]] = {}
 
     def ensure_auth(self) -> None:
         if self.mock_dir is None:
@@ -171,6 +192,31 @@ class ProxyState:
             conv_id = uuid.uuid4().hex
             self._conversations[key] = conv_id
         return conv_id
+
+    def record_response_id(self, conv_id: str, response_id: str) -> None:
+        """记录会话最近一次上游响应 id（仅流正常结束时调用）。"""
+        if not conv_id or not response_id:
+            return
+        if len(self._last_response_id) > 1000:
+            self._last_response_id.clear()
+        self._last_response_id[conv_id] = response_id
+
+    def peek_previous_response_id(self, conv_id: str) -> str | None:
+        """读取会话上一轮响应 id（供 forward_chat 注入 previous_response_id）。"""
+        return self._last_response_id.get(conv_id)
+
+    def get_trace_id(self, conv_id: str) -> str:
+        """同 conv_id 复用同一 b3 traceid（官方 IDE 同会话延续 traceid，spanid 每请求新生成）。"""
+        if len(self._trace_ids) > 1000:
+            self._trace_ids.clear()
+        entry = self._trace_ids.get(conv_id)
+        if entry:
+            trace_id, count = entry
+            self._trace_ids[conv_id] = (trace_id, count + 1)
+            return trace_id
+        trace_id = _hex32()
+        self._trace_ids[conv_id] = (trace_id, 1)
+        return trace_id
     
     def write_log(self, event: str, **kwargs) -> None:
         if self.log_file is None:
@@ -274,6 +320,46 @@ def _prepare_upstream_payload(body: dict[str, Any]) -> tuple[bytes, dict]:
     """序列化上游 body，超过阈值时 gzip（返回 (payload, extra_headers)）。"""
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return gzip_body_if_large(raw)
+
+
+def _extract_upstream_response_id(chunk: dict[str, Any]) -> str | None:
+    """从上游 SSE data JSON 中提取响应 id（cmb- 前缀，或 responses 协议的 response.id）。
+
+    cmb-xxx 是"上一轮响应 id"（每轮都变），与会话级 conversation_id 语义不同，勿混用。
+    """
+    if not isinstance(chunk, dict):
+        return None
+    response = chunk.get("response")
+    if isinstance(response, dict):
+        rid = response.get("id")
+        if isinstance(rid, str) and rid:
+            return rid
+    rid = chunk.get("id")
+    if isinstance(rid, str) and rid.startswith("cmb-"):
+        return rid
+    return None
+
+
+def resolve_device_token(cli_value: str | None = None) -> tuple[str | None, str]:
+    """解析 x-device-token：CLI 参数 > 环境变量 CODEBUDDY_DEVICE_TOKEN > 自动发现。
+
+    CLI/env 值可以是裸 token、JSON（{"token": ...}）或指向此类文件的路径。
+    返回 (token, source)；找不到返回 (None, "")。
+    """
+    for source_name, raw in (
+        ("cli:--device-token", cli_value),
+        ("env:CODEBUDDY_DEVICE_TOKEN", os.getenv("CODEBUDDY_DEVICE_TOKEN")),
+    ):
+        token = _coerce_token_value(raw)
+        if token:
+            return token, source_name
+    try:
+        found = _find_device_token()
+    except Exception:
+        found = None
+    if found and found.get("token"):
+        return str(found["token"]), str(found.get("source") or "auto-discovery")
+    return None, ""
 
 
 def body_summary(body: dict[str, Any]) -> dict[str, Any]:
@@ -604,13 +690,20 @@ async def forward_chat(
     upstream_body["stream"] = True
     upstream_body.setdefault("stream_options", {"include_usage": True})
     
+    # previous_response_id 会话延续：客户端未显式指定时，链式传递上一轮上游响应 id
+    prev_resp_id = state.peek_previous_response_id(conv_id)
+    if prev_resp_id and not upstream_body.get("previous_response_id"):
+        upstream_body["previous_response_id"] = prev_resp_id
+    
     
     url = state.client.endpoint + "/v2/chat/completions"
     model = upstream_body.get("model", "")
-    finger_headers = official_ide_headers(model, conv_id, state.client.platform)
+    finger_headers = official_ide_headers(
+        model, conv_id, state.client.platform, device_token=state.device_token or ""
+    )
     msg_id = _hex32()
     req_id = _hex32()
-    trace_id = _hex32()
+    trace_id = state.get_trace_id(conv_id)
     span_id = _hex16()
     
     base_headers = {
@@ -680,6 +773,7 @@ async def stream_upstream(
     """
     state = get_state()
     stream_start_time = time.time()
+    conv_id = (headers or {}).get("x-conversation-id") or ""
     
     # 【日志】流开始
     state.write_log("stream_started", protocol=protocol, timestamp=stream_start_time)
@@ -704,6 +798,7 @@ async def stream_upstream(
     response_text_started = False
     chunk_count = 0
     done_seen = False
+    upstream_response_id: str | None = None
     raw_chunks: list[bytes] = []
     last_progress_log = stream_start_time
     detected_tool_calls = []
@@ -778,6 +873,9 @@ async def stream_upstream(
                         continue
                     
                     chunk_count += 1
+                    rid = _extract_upstream_response_id(chunk)
+                    if rid:
+                        upstream_response_id = rid
                     
                     # 根据协议转换事件
                     if protocol == "openai":
@@ -949,6 +1047,10 @@ async def stream_upstream(
         yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
     
     finally:
+        # previous_response_id 会话延续：仅流正常结束（upstream_done）时记录
+        if done_seen and upstream_response_id and conv_id:
+            state.record_response_id(conv_id, upstream_response_id)
+        
         # 【日志】流完成
         if state.verbose_llm:
             raw_response = b"\n".join(raw_chunks)
@@ -975,10 +1077,12 @@ async def collect_upstream(
 ) -> dict[str, Any]:
     """聚合上游流式响应为单个 JSON 对象（非流式场景）。"""
     state = get_state()
+    conv_id = (headers or {}).get("x-conversation-id") or ""
     
     usage = None
     finish_reason = None
     content = ""
+    upstream_response_id: str | None = None
     tool_calls_dict: dict[int, dict] = {}  # 使用 dict 按 index 累加
     # DSML 缓冲区
     dsml_buffer = DSMLStreamBuffer()
@@ -1010,6 +1114,10 @@ async def collect_upstream(
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    
+                    rid = _extract_upstream_response_id(chunk)
+                    if rid:
+                        upstream_response_id = rid
                     
                     usage = chunk.get("usage") or usage
                     
@@ -1073,6 +1181,10 @@ async def collect_upstream(
     if tool_calls and dsml_buffer.should_emit_tool_calls():
         finish_reason = "tool_calls"
     
+    
+    # previous_response_id 会话延续：流正常聚合完成（无上游异常）时记录
+    if upstream_response_id and conv_id:
+        state.record_response_id(conv_id, upstream_response_id)
     
     # 【日志】收集完成
     if state.verbose_llm:
@@ -1210,11 +1322,28 @@ def main():
                         help="登录时不自动打开浏览器")
     parser.add_argument("--verbose-llm", action="store_true",
                         help="log full LLM request/response content (default: summary only, saves 98%% space)")
+    parser.add_argument("--device-token", default=None,
+                        help="x-device-token：裸 token 值、JSON 文件（extract_device_token.py --output）"
+                             "或其路径；也可用 CODEBUDDY_DEVICE_TOKEN 环境变量。"
+                             "缺省时尝试自动发现（官方 IDE 下大概率找不到，见 extract 脚本注释）")
     args = parser.parse_args()
     
     # 设置日志
     log_dir = args.log_file.parent if args.log_file else pathlib.Path("logs")
     logger = setup_logging(log_dir)
+    
+    # 解析 x-device-token：CLI > 环境变量 > 自动发现
+    device_token, token_source = resolve_device_token(args.device_token)
+    if device_token:
+        logger.info(f"x-device-token loaded from {token_source} (len={len(device_token)})")
+        print(f"x-device-token loaded from {token_source}")
+    else:
+        logger.warning(
+            "x-device-token not found; X-Device-Token header will be omitted. "
+            "Runtime-generated by @tencent/turing-shield-sdk (see server/extract_device_token.py). "
+            "Capture via mitmproxy then: export CODEBUDDY_DEVICE_TOKEN=... or --device-token <file>"
+        )
+        print("WARNING: x-device-token not found; header omitted (see logs / extract_device_token.py)")
     
     # 初始化客户端
     client = CodeBuddyClient(args.endpoint, platform=args.platform, session_file=args.session_file)
@@ -1231,7 +1360,8 @@ def main():
         enable_desensitize=args.desensitize,
         enable_optimize_context=args.optimize_context,
         verbose_llm=args.verbose_llm,
-        logger=logger
+        logger=logger,
+        device_token=device_token,
     )
     
     # 启动信息输出到 stdout
