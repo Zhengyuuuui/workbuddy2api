@@ -25,6 +25,7 @@ Usage with uv:
 
 import argparse
 import base64
+import gzip
 import hashlib
 import io
 import json
@@ -139,10 +140,37 @@ class ProxyState:
         self.verbose_llm = verbose_llm
         self.logger = logger
         self.started_at = time.time()
-    
+        # 客户端会话键（body 轻量指纹）→ conversation_id，模拟 IDE 会话链路
+        self._conversations: dict[str, str] = {}
+
     def ensure_auth(self) -> None:
         if self.mock_dir is None:
             self.client.ensure_authenticated()
+
+    @staticmethod
+    def _conversation_fingerprint(body: dict[str, Any]) -> str:
+        """对请求 body 做轻量指纹：首个 system 消息前200字符 + model + tools 数量。"""
+        messages = body.get("messages") or []
+        system_prefix = ""
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "system":
+                content = msg.get("content", "")
+                system_prefix = (content if isinstance(content, str) else str(content))[:200]
+                break
+        tools_count = len(body.get("tools") or [])
+        raw = f"{system_prefix}|{body.get('model', '')}|{tools_count}"
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+    def get_conversation_id(self, body: dict[str, Any]) -> str:
+        """相同指纹复用同一 conversation_id；dict 超过 1000 条时清空防内存增长。"""
+        if len(self._conversations) > 1000:
+            self._conversations.clear()
+        key = self._conversation_fingerprint(body)
+        conv_id = self._conversations.get(key)
+        if not conv_id:
+            conv_id = uuid.uuid4().hex
+            self._conversations[key] = conv_id
+        return conv_id
     
     def write_log(self, event: str, **kwargs) -> None:
         if self.log_file is None:
@@ -191,6 +219,62 @@ def get_state() -> ProxyState:
 # ============================================================================
 # 辅助函数
 # ============================================================================
+
+OFFICIAL_IDE_VERSION = "4.12.0"
+
+
+def _hex32() -> str:
+    return uuid.uuid4().hex
+
+
+def _hex16() -> str:
+    return uuid.uuid4().hex[:16]
+
+
+def official_ide_headers(model: str, conversation_id: str, platform: str, device_token: str = "") -> dict:
+    """构造官方 IDE 指纹 headers。
+
+    platform 为 "workbuddy-ai" 时 x-domain 用 www.workbuddy.ai，
+    否则 www.codebuddy.cn。ide-name/type 保持 CodeBuddyIDE。
+
+    x-device-token 预留接口：下阶段由提取脚本注入，本阶段为空时不发送。
+    """
+    domain = "www.workbuddy.ai" if platform == "workbuddy-ai" else "www.codebuddy.cn"
+    headers = {
+        "user-agent": f"CodeBuddyIDE/{OFFICIAL_IDE_VERSION} CodeBuddy/{OFFICIAL_IDE_VERSION}",
+        "accept": "*/*",
+        "accept-language": "*",
+        "sec-fetch-mode": "cors",
+        "x-requested-with": "XMLHttpRequest",
+        "x-ide-name": "CodeBuddyIDE",
+        "x-ide-type": "CodeBuddyIDE",
+        "x-ide-version": OFFICIAL_IDE_VERSION,
+        "x-product": "SaaS",
+        "x-product-code": "codebuddy",
+        "x-product-version": OFFICIAL_IDE_VERSION,
+        "x-env-id": "production",
+        "x-domain": domain,
+        "x-agent-intent": "craft",
+        "x-model-id": model,
+        "x-conversation-id": conversation_id,
+    }
+    if device_token:
+        headers["x-device-token"] = device_token
+    return headers
+
+
+def gzip_body_if_large(body_bytes: bytes, threshold: int = 4096) -> tuple[bytes, dict]:
+    """body 超过 threshold 时 gzip 压缩，返回 (数据, {"Content-Encoding": "gzip"})"""
+    if len(body_bytes) <= threshold:
+        return body_bytes, {}
+    return gzip.compress(body_bytes), {"Content-Encoding": "gzip"}
+
+
+def _prepare_upstream_payload(body: dict[str, Any]) -> tuple[bytes, dict]:
+    """序列化上游 body，超过阈值时 gzip（返回 (payload, extra_headers)）。"""
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    return gzip_body_if_large(raw)
+
 
 def body_summary(body: dict[str, Any]) -> dict[str, Any]:
     messages = body.get("messages") or []
@@ -476,10 +560,11 @@ async def forward_chat(
     state = get_state()
     state.ensure_auth()
     
-    diagnostic("upstream_request", protocol=protocol, **body_summary(body))
-    
     stream = bool(body.get("stream"))
     upstream_body = dict(body)
+    conv_id = state.get_conversation_id(upstream_body)
+    
+    diagnostic("upstream_request", protocol=protocol, conv_id=conv_id, **body_summary(body))
     
     # 海外 WorkBuddy AI 要求首条消息必须是 system prompt
     endpoint = state.client.endpoint.lower()
@@ -507,6 +592,10 @@ async def forward_chat(
                   truncated_count=MAX_TOOLS,
                   reason="Upstream API tool limit")
     
+    # 官方 IDE 默认 max_tokens（客户端未指定时）
+    if not upstream_body.get("max_tokens"):
+        upstream_body["max_tokens"] = 393216
+    
     # 应用脱敏处理
     if state.enable_desensitize:
         upstream_body = desensitize_body(upstream_body, compact_harness=True)
@@ -517,11 +606,46 @@ async def forward_chat(
     
     
     url = state.client.endpoint + "/v2/chat/completions"
-    headers = {
+    model = upstream_body.get("model", "")
+    finger_headers = official_ide_headers(model, conv_id, state.client.platform)
+    msg_id = _hex32()
+    req_id = _hex32()
+    trace_id = _hex32()
+    span_id = _hex16()
+    
+    base_headers = {
         **state.client.auth_headers(),
         "Content-Type": "application/json",
-        "Accept": "text/event-stream",
+        "user-agent": f"CodeBuddyIDE/{OFFICIAL_IDE_VERSION} CodeBuddy/{OFFICIAL_IDE_VERSION}",
+        "x-ide-name": "CodeBuddyIDE",
+        "x-ide-type": "CodeBuddyIDE",
+        "x-ide-version": OFFICIAL_IDE_VERSION,
+        "x-product": "SaaS",
+        "x-product-code": "codebuddy",
+        "x-product-version": OFFICIAL_IDE_VERSION,
+        "x-env-id": "production",
+        "x-agent-intent": "craft",
+        "x-model-id": model,
+        "x-conversation-id": conv_id,
+        "x-conversation-message-id": msg_id,
+        "x-conversation-request-id": req_id,
+        "x-request-id": req_id,
+        "x-request-trace-id": str(uuid.uuid4()),
+        "x-b3-traceid": trace_id,
+        "x-b3-spanid": span_id,
+        "x-b3-sampled": "1",
+        "b3": f"{trace_id}-{span_id}-1",
+        "x-requested-with": "XMLHttpRequest",
+        "accept": "*/*",
+        "sec-fetch-mode": "cors",
+        "monitor_httpsendtime": str(int(time.time() * 1000)),
     }
+    # 合并指纹 headers：跳过与 base_headers 大小写冲突的键（避免 httpx 双发拼接）
+    base_keys_lower = {k.lower() for k in base_headers}
+    for k, v in finger_headers.items():
+        if k.lower() not in base_keys_lower:
+            base_headers[k] = v
+    headers = base_headers
     
     if stream:
         # 流式：直接转发
@@ -587,8 +711,10 @@ async def stream_upstream(
         # 异步HTTP客户端：timeout=None 依赖TCP超时
         # 使用合理的超时配置：连接超时30s，读取超时300s
         timeout_config = httpx.Timeout(30.0, read=300.0)
+        payload, extra_headers = _prepare_upstream_payload(body)
+        request_headers = {**headers, **extra_headers}
         async with httpx.AsyncClient(timeout=timeout_config, trust_env=False) as client:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
+            async with client.stream("POST", url, headers=request_headers, content=payload) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", "replace")
@@ -860,8 +986,10 @@ async def collect_upstream(
     try:
         # 使用合理的超时配置：连接超时30s，读取超时300s
         timeout_config = httpx.Timeout(30.0, read=300.0)
+        payload, extra_headers = _prepare_upstream_payload(body)
+        request_headers = {**headers, **extra_headers}
         async with httpx.AsyncClient(timeout=timeout_config, trust_env=False) as client:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
+            async with client.stream("POST", url, headers=request_headers, content=payload) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     raise HTTPException(
