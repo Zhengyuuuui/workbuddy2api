@@ -2,7 +2,32 @@
 
 > WorkBuddy 国际国内多账号反代网关 — 双域独立路由与切换、稳定设备指纹防风控、国内成长任务全自动完成、后台定时调度器、Web监控看板，支持 Codex / Claude Code / DSH 与标准 OpenAI 客户端。
 
-> 一个轻量级的本地 API 代理服务，将腾讯 **CodeBuddy（国内版）** 与 **WorkBuddy AI（海外版）** 的底层接口转换为标准的 OpenAI、Anthropic 和 Responses 协议格式。
+## 🔥 核心亮点：官方 IDE 指纹伪装（独家防风控）
+
+> **消费记录归因 `CodeBuddyIDE`，而非匿名 "-"** —— 平台风控无法将代理流量与官方 IDE 区分开。
+
+同类反代工具的请求会被腾讯后台记账为匿名通道（来源列显示 "-"），叠加无设备指纹、孤立请求等特征，
+极易触发风控封号（429 频率限制 → 11140 request illegal 账号级封锁）。
+
+本方案通过逆向官方 CodeBuddy IDE 4.12.0（mitmproxy 完整抓包）实现**请求级伪装**：
+
+| 伪装维度 | 说明 |
+|---|---|
+| **客户端身份** | `CodeBuddyIDE/4.12.0` UA + x-ide-name/type/version + x-product 全链对齐 |
+| **会话链路** | 会话级 `x-conversation-id` 复用 + 消息级/请求级 ID 链，行为画像等同真人 IDE 操作 |
+| **响应延续** | `previous_response_id` 从上游响应自动提取、同会话链式传递（与官方 IDE 相同机制） |
+| **链路追踪** | 同会话延续 `x-b3-traceid`，每请求新 `spanid`（对齐官方追踪行为） |
+| **请求规范** | `max_tokens` 393216、大 body 自动 gzip、请求 ID 32hex 格式（记账归因正确的前提） |
+| **设备指纹** | `x-device-token` 注入接口（turing-shield 运行时 token，支持环境变量/文件/CLI 注入） |
+
+已实测验证：开启伪装后，腾讯云控制台消费记录来源列显示 `CodeBuddyIDE`，请求 ID 格式与官方一致。
+
+> 逆向与抓包方法论沉淀：[doc/mitm-capture-playbook.md](doc/mitm-capture-playbook.md)，
+> 封禁事件复盘与防风控清单：[doc/incident-postmortem-and-hardening-checklist.md](doc/incident-postmortem-and-hardening-checklist.md)
+
+## 项目简介
+
+一个轻量级的本地 API 代理服务，将腾讯 **CodeBuddy（国内版）** 与 **WorkBuddy AI（海外版）** 的底层接口转换为标准的 OpenAI、Anthropic 和 Responses 协议格式。
 
 **同一个 proxy，两个平台，一套模型池：**
 
