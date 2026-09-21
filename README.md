@@ -2,28 +2,14 @@
 
 > WorkBuddy 国际国内多账号反代网关 — 双域独立路由与切换、稳定设备指纹防风控、国内成长任务全自动完成、后台定时调度器、Web监控看板，支持 Codex / Claude Code / DSH 与标准 OpenAI 客户端。
 
-## 🔥 核心亮点：官方 IDE 指纹伪装（独家防风控）
+## 🔧 官方客户端指纹模拟
 
-> **消费记录归因 `CodeBuddyIDE`，而非匿名 "-"** —— 平台风控无法将代理流量与官方 IDE 区分开。
+代理请求默认模拟官方 CodeBuddy IDE 的请求特征，避免因流量特征与官方客户端差异过大而触发平台风控（参考[踩坑记录](doc/incident-postmortem-and-hardening-checklist.md)）：
 
-同类反代工具的请求会被腾讯后台记账为匿名通道（来源列显示 "-"），叠加无设备指纹、孤立请求等特征，
-极易触发风控封号（429 频率限制 → 11140 request illegal 账号级封锁）。
-
-本方案通过逆向官方 CodeBuddy IDE 4.12.0（mitmproxy 完整抓包）实现**请求级伪装**：
-
-| 伪装维度 | 说明 |
-|---|---|
-| **客户端身份** | `CodeBuddyIDE/4.12.0` UA + x-ide-name/type/version + x-product 全链对齐 |
-| **会话链路** | 会话级 `x-conversation-id` 复用 + 消息级/请求级 ID 链，行为画像等同真人 IDE 操作 |
-| **响应延续** | `previous_response_id` 从上游响应自动提取、同会话链式传递（与官方 IDE 相同机制） |
-| **链路追踪** | 同会话延续 `x-b3-traceid`，每请求新 `spanid`（对齐官方追踪行为） |
-| **请求规范** | `max_tokens` 393216、大 body 自动 gzip、请求 ID 32hex 格式（记账归因正确的前提） |
-| **设备指纹** | `x-device-token` 注入接口（turing-shield 运行时 token，支持环境变量/文件/CLI 注入） |
-
-已实测验证：开启伪装后，腾讯云控制台消费记录来源列显示 `CodeBuddyIDE`，请求 ID 格式与官方一致。
-
-> 逆向与抓包方法论沉淀：[doc/mitm-capture-playbook.md](doc/mitm-capture-playbook.md)，
-> 封禁事件复盘与防风控清单：[doc/incident-postmortem-and-hardening-checklist.md](doc/incident-postmortem-and-hardening-checklist.md)
+- 请求头对齐官方 `CodeBuddyIDE/4.12.0`（UA、x-ide-*、x-product-* 等）
+- 会话级 conversation_id 复用，previous_response_id 随会话链式传递
+- b3 追踪链同会话延续；大请求体自动 gzip；max_tokens 与官方一致
+- `x-device-token` 支持通过环境变量 / `--device-token` 注入（获取方式见[抓包手册](doc/mitm-capture-playbook.md)）
 
 ## 项目简介
 
@@ -74,8 +60,7 @@ workbuddy2api/
 ## ✨ 核心特性
 
 - **双域独立路由与切换** - 国内 CodeBuddy 与海外 WorkBuddy AI 一键切换，独立路由互不干扰
-- **官方 IDE 指纹伪装（防风控）** - 请求完整对齐官方 CodeBuddyIDE 客户端特征：UA/x-ide-*/x-product-*/会话 ID 链/b3 追踪链/previous_response_id 延续/device-token 接口，消费记录归因 `CodeBuddyIDE` 而非匿名 "-"
-- **稳定设备指纹防风控** - 会话级 conversation_id 复用 + 同会话 b3 traceid 延续 + 响应 id 链式传递，行为画像对齐真实 IDE 使用
+- **官方客户端指纹模拟** - 请求特征对齐官方 CodeBuddyIDE 客户端（UA、会话 ID 链、previous_response_id 延续、b3 追踪链等）
 - **协议转换** - 支持 OpenAI Chat Completions、Anthropic Messages API 和 Responses 三种标准格式，兼容 Codex / Claude Code / DSH 等主流客户端
 - **脱敏处理** - 内置智能脱敏模块，自动过滤敏感信息（账号、密码、密钥、品牌词、路径等），有效缓解审核误拦
 - **消息压缩** - 智能压缩历史消息，大幅降低 token 使用量（适用于 Codex CLI 等长上下文场景）
