@@ -1,6 +1,6 @@
 # WorkBuddy2API
 
-> WorkBuddy 国际国内多账号反代网关 — 双域独立路由与切换、稳定设备指纹防风控、国内成长任务全自动完成、后台定时调度器、Web监控看板，支持 Codex / Claude Code / DSH 与标准 OpenAI 客户端。
+> WorkBuddy 国际国内多账号反代网关 — 双域独立路由与切换、稳定设备指纹防风控、国内成长任务全自动完成，支持 Codex / Claude Code / DSH 与标准 OpenAI 客户端。
 
 ## 🔧 官方客户端指纹模拟
 
@@ -10,6 +10,7 @@
 - 会话级 conversation_id 复用，previous_response_id 随会话链式传递
 - b3 追踪链同会话延续；大请求体自动 gzip；max_tokens 与官方一致
 - `x-device-token` 支持通过环境变量 / `--device-token` 注入（获取方式见[抓包手册](doc/mitm-capture-playbook.md)）
+- 设备指纹获取：按[抓包手册 §7](doc/mitm-capture-playbook.md) 自行抓取（一设备一账号，勿共用）
 
 ## 项目简介
 
@@ -69,7 +70,6 @@ workbuddy2api/
 - **流式响应** - 支持 SSE 流式输出，实时返回生成内容
 - **多账号管理** - 支持多个登录态隔离，方便工作/个人账号切换
 - **国内成长任务自动化** - 签到等成长任务全自动完成（规划中）
-- **后台定时调度器 / Web 监控看板** - 额度监控、任务调度、状态可视化（规划中）
 
 ## 安装
 
@@ -251,7 +251,9 @@ model_provider = "codebuddy"
 --no-browser             登录时不打开浏览器
 --verbose-llm            记录完整请求/响应内容（默认仅摘要）
 --mock-dir DIR           使用 mock 数据（测试用）
---device-token PATH      x-device-token（裸 token / JSON 文件路径）
+--device-token PATH      x-device-token 注入：裸 token / JSON 文件路径
+                         （也可用环境变量 CODEBUDDY_DEVICE_TOKEN；
+                           获取方式见 doc/mitm-capture-playbook.md §7）
 --rate-qps FLOAT         全局限速：持续 QPS（默认 1.0，0 不限速）
 --rate-burst INT         全局限速：突发容量（默认 5，超出排队）
 --rate-jitter FLOAT      每请求随机抖动上限（秒，默认 3.0，0 关闭）
@@ -435,6 +437,12 @@ proxy 已自动处理（会自动补 system 首条消息），如仍有问题请
 ```bash
 uv run pytest server/test_*.py -v
 ```
+
+## 多用户安全须知
+
+- **一设备一账号**：`x-device-token` 与账号是「设备 + 账号」绑定关系。多个账号共用同一个 token 会被平台做**设备关联**，触发连坐封号——每台设备只能用自己的 token
+- token / session 文件位于 `~/.codebuddy-device-token.json` 与 `~/.codebuddy-session.json`（已被 `.gitignore` 的 `*device-token*.json`、`*session*.json` 规则排除，**不会入库**）
+- 请勿分享自己的 token，也请勿使用他人分享的 token——被关联的是一整台设备，换号也救不回来
 
 ## 免责声明
 

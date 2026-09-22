@@ -296,3 +296,53 @@ accept: */*   accept-language: *   sec-fetch-mode: cors
 | `.ydevsphere/official-ide-headers.txt` | 官方 IDE chat 请求 headers 快照（已脱敏 authorization） |
 | `/tmp/wb-capture/flows-copilot.mitm` | 完整原始流量（重启后丢失，重要请自行备份） |
 | `.ydevsphere/` | gitignore 内，不会提交 |
+
+
+## 7. device-token 获取指引（用户自助）
+
+`x-device-token` 由官方 IDE 的 turing-shield SDK 运行时生成（native addon），不落盘，
+无法从文件提取，需自行抓包获取。前置：安装 mitmproxy、已登录官方 CodeBuddy IDE。
+
+以下为 macOS 实操步骤（Linux 需将 pf 换成 iptables/nftables，思路相同）：
+
+```bash
+# 1. 解析 IDE 实际连接的 IP（IDE 会直连绕过代理）
+IP=$(dscacheutil -q host -a name copilot.tencent.com | awk '/ip_address/{print $2; exit}')
+
+# 2. 启动抓包（会占 443，需 sudo；保持前台运行）
+sudo mitmdump --mode reverse:https://copilot.tencent.com/ --listen-port 443 \
+  --set save_stream_file=/tmp/dt.mitm --set keep_host_header=true
+
+# 3. 另开终端：把 IDE 的流量引到本机 mitm
+sudo route add -host $IP 127.0.0.1
+echo "rdr pass on lo0 inet proto tcp from any to $IP port 443 -> 127.0.0.1 port 443" | sudo pfctl -f -
+echo "127.0.0.1 copilot.tencent.com" | sudo tee -a /etc/hosts && sudo dscacheutil -flushcache
+```
+
+```bash
+# 4. 在官方 IDE 里随便发一条 AI 对话，然后验证抓到了 token：
+mitmdump -nr /tmp/dt.mitm -s /dev/stdin <<'INNER'
+def response(flow):
+    t = flow.request.headers.get('x-device-token')
+    if t and flow.request.path.startswith('/v2/chat/completions'):
+        print(t)  # 复制这个值
+INNER
+
+# 5. 保存并注入 bridge（二选一）
+export CODEBUDDY_DEVICE_TOKEN='<刚复制的 token>'
+# 或写入 0600 JSON 文件：{"token": "<值>", "_warning": "per-device secret, never share"}
+
+# 6. 清理（务必执行，否则本机网络被劫持）
+sudo pkill -f mitmdump
+sudo sed -i '' '/copilot.tencent.com/d' /etc/hosts
+sudo route delete $IP
+sudo pfctl -F all
+sudo dscacheutil -flushcache
+```
+
+注意事项：
+
+- token 与"设备+账号"绑定，**一设备一账号一 token**；多账号共用会设备关联连坐封号
+- token 有时效，失效后重复上述步骤重抓
+- token 文件（如有）已在 .gitignore 排除，勿分享勿提交
+- Windows/Linux 用户思路相同：hosts 指向 127.0.0.1 + mitmproxy reverse 模式 + 抓 /v2/chat/completions 请求头

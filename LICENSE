@@ -3,7 +3,7 @@ MIT License
 Copyright (c) 2026 Zhengyuuuui
 
 WorkBuddy 国际国内多账号反代网关 — 双域独立路由与切换、稳定设备指纹防风控、
-国内成长任务全自动完成、后台定时调度器、Web监控看板，支持 Codex / Claude Code /
+国内成长任务全自动完成，支持 Codex / Claude Code /
 DSH 与标准 OpenAI 客户端。
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
