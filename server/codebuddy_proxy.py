@@ -859,7 +859,14 @@ def _parse_credits_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
         return None
     accounts_raw = payload.get("Accounts")
     if accounts_raw is None and isinstance(payload.get("data"), dict):
-        accounts_raw = payload["data"].get("Accounts")
+        d = payload["data"]
+        # 结构 A: {data: {Accounts: []}}
+        accounts_raw = d.get("Accounts")
+        # 结构 B（实测海外）: {data: {Response: {Data: {Accounts: []}}}}
+        if accounts_raw is None and isinstance(d.get("Response"), dict):
+            resp = d["Response"]
+            if isinstance(resp.get("Data"), dict):
+                accounts_raw = resp["Data"].get("Accounts")
     if not isinstance(accounts_raw, list) or not accounts_raw:
         return None
 
