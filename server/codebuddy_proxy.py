@@ -24,6 +24,7 @@ Usage with uv:
 """
 
 import argparse
+import asyncio
 import base64
 import gzip
 import hashlib
@@ -31,11 +32,16 @@ import io
 import json
 import logging
 import logging.handlers
+import math
 import os
 import pathlib
+import random
+import re
 import sys
 import time
 import uuid
+from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
@@ -146,6 +152,10 @@ class ProxyState:
         verbose_llm: bool = False,
         logger: logging.Logger | None = None,
         device_token: str | None = None,
+        rate_qps: float = 1.0,
+        rate_burst: int = 5,
+        rate_jitter: float = 3.0,
+        credit_burn_threshold: float = 0.3,
     ):
         self.client = client
         self.mock_dir = mock_dir
@@ -157,6 +167,15 @@ class ProxyState:
         self.started_at = time.time()
         # 官方 IDE 设备指纹令牌（x-device-token）；None 表示不发送该头
         self.device_token = device_token
+        # P2：全局限速器（全局单例）+ 429/5xx 熔断器（按 endpoint×model 隔离）
+        self.rate_limiter = RateLimiter(rate_qps=rate_qps, burst=rate_burst, jitter=rate_jitter)
+        self.breaker = UpstreamCircuitBreaker()
+        # P2：消耗速率监控——滑动窗口（最近 10 分钟）(timestamp, 估算消耗)
+        self.credit_burn_threshold = credit_burn_threshold
+        self._usage_events: deque[tuple[float, float]] = deque()
+        self._credits_total_remain: float | None = None  # 最近一次成功获取的剩余额度
+        self._credits_cache: dict[str, Any] | None = None  # {"fetched_at": float, "payload": dict}
+        self._burn_warned = False
         # 客户端会话键（body 轻量指纹）→ conversation_id，模拟 IDE 会话链路
         self._conversations: dict[str, str] = {}
         # conv_id → 上一轮上游响应 id（previous_response_id 会话延续）
@@ -217,7 +236,52 @@ class ProxyState:
         trace_id = _hex32()
         self._trace_ids[conv_id] = (trace_id, 1)
         return trace_id
-    
+
+    def _prune_usage(self, now: float | None = None) -> float:
+        """清理 10 分钟窗口外的消耗事件，返回窗口内估算消耗总和。"""
+        now = time.time() if now is None else now
+        cutoff = now - 600
+        while self._usage_events and self._usage_events[0][0] < cutoff:
+            self._usage_events.popleft()
+        return sum(v for _, v in self._usage_events)
+
+    def _burn_threshold(self) -> float:
+        """消耗速率告警阈值：credits 可用时为 total_remain 的比例，否则兜底 500。"""
+        if self._credits_total_remain is not None:
+            return max(0.0, self._credits_total_remain) * self.credit_burn_threshold
+        return 500.0
+
+    def record_burn(self, model: str, usage: dict[str, Any] | None) -> None:
+        """记录一次成功上游请求的估算消耗（prompt+completion tokens），只告警不拒绝。"""
+        if not isinstance(usage, dict):
+            return
+        try:
+            tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            return
+        if tokens <= 0:
+            return
+        now = time.time()
+        self._usage_events.append((now, float(tokens)))
+        window = self._prune_usage(now)
+        threshold = self._burn_threshold()
+        if window > threshold:
+            if not self._burn_warned:
+                self._burn_warned = True
+                diagnostic(
+                    "credit_burn_warning",
+                    model=model,
+                    window_tokens=window,
+                    threshold=round(threshold, 2),
+                    credits_available=self._credits_total_remain is not None,
+                )
+        else:
+            self._burn_warned = False
+
+    def burn_window_total(self) -> float:
+        """当前 10 分钟滑动窗口内的估算消耗总和。"""
+        return self._prune_usage()
+
     def write_log(self, event: str, **kwargs) -> None:
         if self.log_file is None:
             return
@@ -275,6 +339,195 @@ def _hex32() -> str:
 
 def _hex16() -> str:
     return uuid.uuid4().hex[:16]
+
+
+class RateLimiter:
+    """异步令牌桶全局限速：持续 rate QPS、突发容量 burst。
+
+    acquire() 排队等待而非拒绝——排队是"好公民"行为；令牌到手后再附加随机抖动。
+    rate_qps <= 0 表示不限速（仅抖动）。
+    """
+
+    def __init__(self, rate_qps: float = 1.0, burst: int = 5, jitter: float = 3.0):
+        self.rate_qps = float(rate_qps)
+        self.burst = max(1, int(burst))
+        self.jitter = max(0.0, float(jitter))
+        self._tokens = float(self.burst)
+        self._last_refill = time.monotonic()
+        self._waiting = 0
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        if self.rate_qps > 0:
+            elapsed = now - self._last_refill
+            self._tokens = min(float(self.burst), self._tokens + elapsed * self.rate_qps)
+        self._last_refill = now
+
+    async def acquire(self) -> float:
+        """等待获取一个令牌（外加随机抖动），返回实际等待秒数。"""
+        self._waiting += 1
+        try:
+            waited = 0.0
+            while True:
+                self._refill()
+                if self.rate_qps <= 0:
+                    break
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    break
+                delay = max((1.0 - self._tokens) / self.rate_qps, 0.005)
+                t0 = time.monotonic()
+                await asyncio.sleep(delay)
+                waited += time.monotonic() - t0
+            if self.jitter > 0:
+                t0 = time.monotonic()
+                await asyncio.sleep(random.uniform(0.0, self.jitter))
+                waited += time.monotonic() - t0
+            return waited
+        finally:
+            self._waiting -= 1
+
+    def status(self) -> dict[str, Any]:
+        self._refill()
+        return {
+            "rate_qps": self.rate_qps,
+            "burst": self.burst,
+            "jitter_seconds": self.jitter,
+            "available_tokens": round(self._tokens, 2),
+            "queued_requests": self._waiting,
+        }
+
+
+class UpstreamCircuitBreaker:
+    """上游熔断器：按 (endpoint, model) 二元组独立熔断。
+
+    - 429：按 details 中的 reset 时间冷却（中英文文案，UTC+8 解析），解析不出默认 300s
+    - 连续 5 次 5xx：熔断 120s；200 成功清零连续计数
+    - 冷却到期惰性恢复（无后台线程）
+    """
+
+    DEFAULT_429_COOLDOWN = 300.0
+    DEFAULT_5XX_COOLDOWN = 120.0
+    MAX_5XX_STREAK = 5
+    _RESET_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}:\d{2}")
+
+    def __init__(self):
+        self._trips: dict[tuple[str, str], dict[str, Any]] = {}
+        self._streaks: dict[tuple[str, str], int] = {}
+
+    @staticmethod
+    def parse_reset_at(text: str | None, now: float | None = None) -> float | None:
+        """解析 429 details 中的重置时间为 epoch（文案中的时间按 UTC+8 解释）。
+
+        支持中英文两种实测文案：
+          "usage will reset at 2026-09-13 10:46:15 UTC+8"
+          "将在 2026-09-13 14:48:28 UTC+8 重置"
+        解析不出或时间已过返回 None（调用方回退默认 300s 冷却）。
+        """
+        if not text:
+            return None
+        m = UpstreamCircuitBreaker._RESET_RE.search(text)
+        if not m:
+            return None
+        try:
+            dt = datetime.strptime(m.group(0).replace("T", " "), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+        epoch = dt.replace(tzinfo=timezone(timedelta(hours=8))).timestamp()
+        if now is None:
+            now = time.time()
+        return epoch if epoch > now else None
+
+    @staticmethod
+    def _key(endpoint: str, model: str) -> tuple[str, str]:
+        return (endpoint or "", model or "")
+
+    def trip(self, endpoint: str, model: str, reset_at: float | None = None, reason: str = "") -> float:
+        """记录熔断；reset_at 缺省时默认从现在起冷却 300 秒。返回冷却总时长。"""
+        if reset_at is None:
+            reset_at = time.time() + self.DEFAULT_429_COOLDOWN
+        self._trips[self._key(endpoint, model)] = {
+            "reset_at": float(reset_at),
+            "reason": reason,
+            "tripped_at": time.time(),
+        }
+        return max(0.0, float(reset_at) - time.time())
+
+    def check(self, endpoint: str, model: str) -> tuple[bool, float]:
+        """返回 (是否熔断中, 剩余秒数)；冷却到期惰性恢复并清理条目。"""
+        key = self._key(endpoint, model)
+        entry = self._trips.get(key)
+        if not entry:
+            return False, 0.0
+        remaining = entry["reset_at"] - time.time()
+        if remaining <= 0:
+            del self._trips[key]
+            return False, 0.0
+        return True, remaining
+
+    def note_success(self, endpoint: str, model: str) -> None:
+        """200 成功：清零 5xx 连续计数（不清除已熔断的冷却条目）。"""
+        self._streaks.pop(self._key(endpoint, model), None)
+
+    def note_5xx(self, endpoint: str, model: str) -> tuple[bool, float]:
+        """5xx 记账：连续第 5 次触发熔断 120 秒。返回 (是否触发熔断, 冷却秒数)。"""
+        key = self._key(endpoint, model)
+        streak = self._streaks.get(key, 0) + 1
+        self._streaks[key] = streak
+        if streak >= self.MAX_5XX_STREAK:
+            self._streaks[key] = 0
+            self.trip(endpoint, model, time.time() + self.DEFAULT_5XX_COOLDOWN,
+                      reason=f"consecutive {self.MAX_5XX_STREAK} 5xx responses")
+            return True, self.DEFAULT_5XX_COOLDOWN
+        return False, 0.0
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """当前熔断状态（活跃冷却 + 进行中的 5xx 计数），过期条目惰性清理。"""
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for key in list(self._trips):
+            entry = self._trips[key]
+            remaining = entry["reset_at"] - now
+            if remaining <= 0:
+                del self._trips[key]
+                continue
+            endpoint, model = key
+            out.append({
+                "endpoint": endpoint,
+                "model": model,
+                "tripped": True,
+                "reason": entry["reason"],
+                "reset_at": entry["reset_at"],
+                "reset_at_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(entry["reset_at"])),
+                "remaining_seconds": round(remaining, 1),
+                "streak_5xx": self._streaks.get(key, 0),
+            })
+        for key, streak in self._streaks.items():
+            if streak > 0 and key not in self._trips:
+                endpoint, model = key
+                out.append({
+                    "endpoint": endpoint,
+                    "model": model,
+                    "tripped": False,
+                    "reason": "",
+                    "reset_at": None,
+                    "reset_at_iso": None,
+                    "remaining_seconds": 0.0,
+                    "streak_5xx": streak,
+                })
+        return out
+
+    def clear(self, model: str | None = None) -> int:
+        """手动清除熔断：model 指定仅清该模型，None 清全部。返回清除的键数。"""
+        keys = set()
+        for store in (self._trips, self._streaks):
+            for key in store:
+                if model is None or key[1] == model:
+                    keys.add(key)
+        for key in keys:
+            self._trips.pop(key, None)
+            self._streaks.pop(key, None)
+        return len(keys)
 
 
 def official_ide_headers(model: str, conversation_id: str, platform: str, device_token: str = "") -> dict:
@@ -492,6 +745,7 @@ async def health():
         "authenticated": bool(auth.get("accessToken")),
         "token_valid": not expires or expires > int(time.time() * 1000),
         "uptime_seconds": int(time.time() - state.started_at),
+        "rate_limiter": state.rate_limiter.status(),
     }
 
 
@@ -577,6 +831,144 @@ async def list_models():
 
 
 # ============================================================================
+# 端点：/v1/breaker（熔断状态运维）
+# ============================================================================
+
+@app.get("/v1/breaker")
+async def breaker_status():
+    state = get_state()
+    breakers = state.breaker.snapshot()
+    return {"breakers": breakers, "count": len(breakers)}
+
+
+@app.delete("/v1/breaker")
+async def breaker_clear(model: str | None = None):
+    state = get_state()
+    cleared = state.breaker.clear(model)
+    diagnostic("circuit_breaker_cleared", model=model, cleared=cleared)
+    return {"cleared": cleared, "model": model}
+
+
+# ============================================================================
+# 端点：/v1/credits（额度监控）
+# ============================================================================
+
+def _parse_credits_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """解析 billing/meter/get-user-resource 响应 → accounts 明细 + 汇总；无 Accounts 返回 None。"""
+    if not isinstance(payload, dict):
+        return None
+    accounts_raw = payload.get("Accounts")
+    if accounts_raw is None and isinstance(payload.get("data"), dict):
+        accounts_raw = payload["data"].get("Accounts")
+    if not isinstance(accounts_raw, list) or not accounts_raw:
+        return None
+
+    def _f(v: Any) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    items = []
+    total_remain = 0.0
+    total_size = 0.0
+    for a in accounts_raw:
+        if not isinstance(a, dict):
+            continue
+        remain = _f(a.get("CapacityRemainPrecise"))
+        size = _f(a.get("CapacitySizePrecise"))
+        total_remain += remain
+        total_size += size
+        cycle = a.get("CycleEndTime")
+        items.append({
+            "PackageName": a.get("PackageName"),
+            "CapacityRemainPrecise": remain,
+            "CapacitySizePrecise": size,
+            "CycleEndTime": str(cycle) if cycle is not None else None,
+        })
+    usage_ratio = ((total_size - total_remain) / total_size) if total_size > 0 else 0.0
+    usage_ratio = max(0.0, min(1.0, usage_ratio))
+    return {
+        "accounts": items,
+        "total_remain": total_remain,
+        "total_size": total_size,
+        "usage_ratio": round(usage_ratio, 4),
+    }
+
+
+async def _fetch_credits(state: ProxyState) -> dict[str, Any]:
+    """调用计费接口；403（国内 code 10085）或网络错误时返回 unavailable 结果。"""
+    url = state.client.endpoint + "/billing/meter/get-user-resource"
+    fetched_at = int(time.time())
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=30.0), trust_env=False) as client:
+            resp = await client.post(
+                url,
+                headers={**state.client.auth_headers(), "Content-Type": "application/json"},
+                json={},
+            )
+    except httpx.HTTPError as exc:
+        return {"available": False, "status": "unavailable", "error": str(exc)[:200],
+                "fetched_at": fetched_at}
+    text = resp.text[:500]
+    if resp.status_code != 200:
+        return {"available": False, "status": "unavailable", "http_status": resp.status_code,
+                "detail": text, "fetched_at": fetched_at}
+    try:
+        payload = resp.json()
+    except ValueError:
+        return {"available": False, "status": "unavailable", "http_status": resp.status_code,
+                "detail": text, "fetched_at": fetched_at}
+    parsed = _parse_credits_payload(payload)
+    if parsed is None:
+        return {"available": False, "status": "unavailable", "http_status": resp.status_code,
+                "detail": text, "fetched_at": fetched_at}
+    return {"available": True, "status": "ok", **parsed, "fetched_at": fetched_at}
+
+
+@app.get("/v1/credits")
+async def get_credits(refresh: int = 0):
+    """额度查询：结果缓存 60 秒（避免频繁打计费接口触发风控），?refresh=1 强制刷新。"""
+    state = get_state()
+    state.ensure_auth()
+
+    now = time.time()
+    cached = state._credits_cache
+    if not refresh and cached and (now - cached["fetched_at"]) < 60:
+        data = dict(cached["payload"])
+        from_cache = True
+    else:
+        data = await _fetch_credits(state)
+        state._credits_cache = {"fetched_at": now, "payload": data}
+        from_cache = False
+        if data.get("available") and data.get("total_remain") is not None:
+            state._credits_total_remain = float(data["total_remain"])
+
+    data = dict(data)
+    data["cached"] = from_cache
+
+    # 消耗速率告警（实时计算；只告警不拒绝）
+    window = state.burn_window_total()
+    if data.get("available") and data.get("total_remain") is not None:
+        threshold = float(data["total_remain"]) * state.credit_burn_threshold
+    else:
+        threshold = 500.0
+    data["burn_warning"] = window > threshold
+
+    if not data.get("available"):
+        # 国内端点 403 等场景：只返回本地已知信息并标注 unavailable
+        data["local"] = {
+            "endpoint": state.client.endpoint,
+            "platform": state.client.platform,
+            "window_burn_tokens": window,
+            "burn_threshold": threshold,
+            "credit_burn_threshold": state.credit_burn_threshold,
+            "window_seconds": 600,
+        }
+    return data
+
+
+# ============================================================================
 # 端点：/v1/chat/completions
 # ============================================================================
 
@@ -651,6 +1043,25 @@ async def forward_chat(
     conv_id = state.get_conversation_id(upstream_body)
     
     diagnostic("upstream_request", protocol=protocol, conv_id=conv_id, **body_summary(body))
+    
+    # P2 熔断：冷却期内快速失败，不打上游（429 与 5xx 熔断统一拒绝格式）
+    model = body.get("model", "")
+    tripped, remaining = state.breaker.check(state.client.endpoint, model)
+    if tripped:
+        seconds = max(1, math.ceil(remaining))
+        diagnostic("circuit_breaker_reject", endpoint=state.client.endpoint, model=model,
+                   remaining_seconds=round(remaining, 1))
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": f"熔断中，剩余 {seconds}s（上游限频），请稍后重试或切换模型",
+                    "type": "circuit_breaker",
+                    "retry_after": seconds,
+                }
+            },
+            headers={"Retry-After": str(seconds)},
+        )
     
     # 海外 WorkBuddy AI 要求首条消息必须是 system prompt
     endpoint = state.client.endpoint.lower()
@@ -740,6 +1151,9 @@ async def forward_chat(
             base_headers[k] = v
     headers = base_headers
     
+    # P2 全局限速 + 随机抖动：排队等待而非拒绝（发起上游请求前）
+    await state.rate_limiter.acquire()
+    
     if stream:
         # 流式：直接转发
         return StreamingResponse(
@@ -799,6 +1213,7 @@ async def stream_upstream(
     chunk_count = 0
     done_seen = False
     upstream_response_id: str | None = None
+    upstream_usage: dict[str, Any] | None = None
     raw_chunks: list[bytes] = []
     last_progress_log = stream_start_time
     detected_tool_calls = []
@@ -813,6 +1228,16 @@ async def stream_upstream(
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", "replace")
+                    endpoint = state.client.endpoint
+                    model = body.get("model", "")
+                    retry_after: int | None = None
+                    if resp.status_code == 429:
+                        reset_at = UpstreamCircuitBreaker.parse_reset_at(error_text)
+                        state.breaker.trip(endpoint, model, reset_at, reason="upstream 429 rate limit")
+                        _, rem = state.breaker.check(endpoint, model)
+                        retry_after = max(1, math.ceil(rem))
+                    elif resp.status_code >= 500:
+                        state.breaker.note_5xx(endpoint, model)
                     
                     diagnostic("upstream_error", protocol=protocol,
                         status=resp.status_code,
@@ -828,6 +1253,8 @@ async def stream_upstream(
                                 "message": f"Upstream API error (HTTP {resp.status_code}): {error_text[:200]}"
                             }
                         }
+                        if retry_after is not None:
+                            error_event["error"]["retry_after"] = retry_after
                         yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n".encode()
                     else:
                         # OpenAI error format
@@ -839,10 +1266,13 @@ async def stream_upstream(
                                 "details": error_text[:500]
                             }
                         }
+                        if retry_after is not None:
+                            error_chunk["error"]["retry_after"] = retry_after
                         yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
                     
                     return
                 
+                state.breaker.note_success(state.client.endpoint, body.get("model", ""))
                 diagnostic("upstream_response", protocol=protocol, status=resp.status_code)
                 
                 # 异步迭代行（自动处理超时和分块）
@@ -876,6 +1306,9 @@ async def stream_upstream(
                     rid = _extract_upstream_response_id(chunk)
                     if rid:
                         upstream_response_id = rid
+                    # P2 消耗监控：include_usage 的末尾 chunk 携带 usage，顺带提取不额外缓冲
+                    if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
+                        upstream_usage = chunk["usage"]
                     
                     # 根据协议转换事件
                     if protocol == "openai":
@@ -1051,6 +1484,10 @@ async def stream_upstream(
         if done_seen and upstream_response_id and conv_id:
             state.record_response_id(conv_id, upstream_response_id)
         
+        # P2 消耗监控：流正常结束才计入滑动窗口
+        if done_seen and upstream_usage:
+            state.record_burn(body.get("model", ""), upstream_usage)
+        
         # 【日志】流完成
         if state.verbose_llm:
             raw_response = b"\n".join(raw_chunks)
@@ -1096,10 +1533,27 @@ async def collect_upstream(
             async with client.stream("POST", url, headers=request_headers, content=payload) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
+                    error_text = error_body.decode("utf-8", "replace")
+                    endpoint = state.client.endpoint
+                    model = body.get("model", "")
+                    if resp.status_code == 429:
+                        reset_at = UpstreamCircuitBreaker.parse_reset_at(error_text)
+                        state.breaker.trip(endpoint, model, reset_at, reason="upstream 429 rate limit")
+                        _, rem = state.breaker.check(endpoint, model)
+                        raise HTTPException(status_code=429, detail={"error": {
+                            "message": error_text[:500] or "upstream rate limited (429)",
+                            "type": "upstream_error",
+                            "code": 429,
+                            "retry_after": max(1, math.ceil(rem)),
+                        }})
+                    if resp.status_code >= 500:
+                        state.breaker.note_5xx(endpoint, model)
                     raise HTTPException(
                         status_code=resp.status_code,
-                        detail={"error": {"message": error_body.decode("utf-8", "replace")[:500], "type": "upstream_error"}}
+                        detail={"error": {"message": error_text[:500], "type": "upstream_error"}}
                     )
+                
+                state.breaker.note_success(state.client.endpoint, body.get("model", ""))
                 
                 async for line in resp.aiter_lines():
                     line = line.strip()
@@ -1185,6 +1639,10 @@ async def collect_upstream(
     # previous_response_id 会话延续：流正常聚合完成（无上游异常）时记录
     if upstream_response_id and conv_id:
         state.record_response_id(conv_id, upstream_response_id)
+    
+    # P2 消耗监控：成功聚合后计入滑动窗口
+    if usage:
+        state.record_burn(body.get("model", ""), usage)
     
     # 【日志】收集完成
     if state.verbose_llm:
@@ -1326,6 +1784,14 @@ def main():
                         help="x-device-token：裸 token 值、JSON 文件（extract_device_token.py --output）"
                              "或其路径；也可用 CODEBUDDY_DEVICE_TOKEN 环境变量。"
                              "缺省时尝试自动发现（官方 IDE 下大概率找不到，见 extract 脚本注释）")
+    parser.add_argument("--rate-qps", type=float, default=1.0,
+                        help="全局限速：持续 QPS（令牌桶补充速率，默认 1.0，0 表示不限速）")
+    parser.add_argument("--rate-burst", type=int, default=5,
+                        help="全局限速：突发容量（默认 5，超出部分排队等待）")
+    parser.add_argument("--rate-jitter", type=float, default=3.0,
+                        help="每请求随机抖动上限（秒，默认 3.0，0 关闭）")
+    parser.add_argument("--credit-burn-threshold", type=float, default=0.3,
+                        help="消耗速率告警阈值：10 分钟窗口消耗占剩余额度比例（默认 0.3）")
     args = parser.parse_args()
     
     # 设置日志
@@ -1362,15 +1828,19 @@ def main():
         verbose_llm=args.verbose_llm,
         logger=logger,
         device_token=device_token,
+        rate_qps=args.rate_qps,
+        rate_burst=args.rate_burst,
+        rate_jitter=args.rate_jitter,
+        credit_burn_threshold=args.credit_burn_threshold,
     )
     
     # 启动信息输出到 stdout
     print(f"CodeBuddy proxy listening on http://{args.host}:{args.port}")
-    print("Endpoints: /v1/models /v1/chat/completions /v1/responses /v1/messages /health")
+    print("Endpoints: /v1/models /v1/chat/completions /v1/responses /v1/messages /v1/credits /v1/breaker /health")
     
     # 同时记录到日志
     logger.info(f"CodeBuddy proxy listening on http://{args.host}:{args.port}")
-    logger.info("Endpoints: /v1/models /v1/chat/completions /v1/responses /v1/messages /health")
+    logger.info("Endpoints: /v1/models /v1/chat/completions /v1/responses /v1/messages /v1/credits /v1/breaker /health")
     
     # 启动 uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

@@ -251,6 +251,11 @@ model_provider = "codebuddy"
 --no-browser             登录时不打开浏览器
 --verbose-llm            记录完整请求/响应内容（默认仅摘要）
 --mock-dir DIR           使用 mock 数据（测试用）
+--device-token PATH      x-device-token（裸 token / JSON 文件路径）
+--rate-qps FLOAT         全局限速：持续 QPS（默认 1.0，0 不限速）
+--rate-burst INT         全局限速：突发容量（默认 5，超出排队）
+--rate-jitter FLOAT      每请求随机抖动上限（秒，默认 3.0，0 关闭）
+--credit-burn-threshold  消耗速率告警阈值（默认 0.3 = 窗口消耗占剩余额度 30%）
 ```
 
 ### 环境变量
@@ -269,11 +274,13 @@ CODEBUDDY_PROXY_LOG_FILE  # 等同 --log-file
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| GET | `/health` | 查询本地服务和认证状态 |
+| GET | `/health` | 查询本地服务、认证状态与限速器状态 |
 | GET | `/v1/models` | 查询模型列表 |
 | POST | `/v1/chat/completions` | OpenAI Chat Completions，支持 tools 和流式响应 |
 | POST | `/v1/responses` | Responses API，兼容 Codex CLI |
 | POST | `/v1/messages` | Anthropic Messages API，兼容 Claude Code / CC Switch |
+| GET | `/v1/credits` | 额度查询（缓存 60s，`?refresh=1` 强刷）+ 消耗速率告警 |
+| GET/DELETE | `/v1/breaker` | 熔断状态查看 / 按 `?model=` 手动清除 |
 
 ### `/v1/chat/completions` - OpenAI Chat
 

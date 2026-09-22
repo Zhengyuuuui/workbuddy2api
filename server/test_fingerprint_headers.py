@@ -136,6 +136,7 @@ def _make_state(tmp_path: pathlib.Path, platform: str = "VSCode") -> ProxyState:
         enable_optimize_context=False,
         verbose_llm=False,
         logger=None,
+        rate_jitter=0.0,  # P2：测试中关闭抖动避免拖慢用例
     )
 
 

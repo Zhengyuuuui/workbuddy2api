@@ -191,6 +191,7 @@ class Harness:
             "account": {"uid": "uid-1"},
             "auth": {"accessToken": "test-token", "expiresAt": int(time.time() * 1000) + 3600_000},
         }
+        kwargs.setdefault("rate_jitter", 0.0)  # P2：测试中关闭抖动避免拖慢用例
         return ProxyState(client=client, mock_dir=self.tmp_path, log_file=None, **kwargs)
 
     def set_state(self, state: ProxyState):
