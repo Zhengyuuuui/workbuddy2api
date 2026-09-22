@@ -224,6 +224,12 @@ class ProxyState:
         """读取会话上一轮响应 id（供 forward_chat 注入 previous_response_id）。"""
         return self._last_response_id.get(conv_id)
 
+    def get_parent_span_id(self, conv_id: str, current_span_id: str) -> str:
+        """返回上一请求的 spanid 作为 parentspanid（官方 IDE 链式行为），无则用当前值。"""
+        prev = self._trace_ids.get(("span", conv_id))
+        self._trace_ids[("span", conv_id)] = current_span_id
+        return prev if prev else current_span_id
+
     def get_trace_id(self, conv_id: str) -> str:
         """同 conv_id 复用同一 b3 traceid（官方 IDE 同会话延续 traceid，spanid 每请求新生成）。"""
         if len(self._trace_ids) > 1000:
@@ -1144,8 +1150,10 @@ async def forward_chat(
         "x-request-trace-id": str(uuid.uuid4()),
         "x-b3-traceid": trace_id,
         "x-b3-spanid": span_id,
+        "x-b3-parentspanid": state.get_parent_span_id(conv_id, span_id),
         "x-b3-sampled": "1",
         "b3": f"{trace_id}-{span_id}-1",
+        "x-trace-id": trace_id,
         "x-requested-with": "XMLHttpRequest",
         "accept": "*/*",
         "sec-fetch-mode": "cors",
