@@ -38,18 +38,40 @@ class TestFindDeviceToken:
         fake = tmp_path / "storage.bin"
         fake.write_bytes(b"prefix junk " + TOKEN_LONG.encode() + b" suffix")
         scanned = []
-        result = find_device_token(scan_dirs=[tmp_path], scanned=scanned)
+        result = find_device_token(scan_dirs=[tmp_path], scanned=scanned, plists=[])
         assert result is not None
         assert result["token"] == TOKEN_LONG
         assert result["source"] == str(fake)
         assert result["found_at"]
         assert str(tmp_path) in scanned
 
+    def test_finds_token_in_binary_plist(self, tmp_path):
+        # 海外 WorkBuddy 的 macOS Preferences 为二进制 plist
+        import plistlib
+        plist_path = tmp_path / "com.tencent.workbuddy.mac.plist"
+        plist_path.write_bytes(plistlib.dumps({
+            "some.turing.key": "88位hex-not-a-token",
+            "nested": {"token": TOKEN_LONG},
+        }, fmt=plistlib.FMT_BINARY))
+        scanned = []
+        result = find_device_token(scan_dirs=[], plists=[plist_path], scanned=scanned)
+        assert result is not None
+        assert result["token"] == TOKEN_LONG
+        assert result["source"] == f"plist:{plist_path}"
+        assert any("plist:" in item for item in scanned)
+
+    def test_plist_without_token_returns_none(self, tmp_path, monkeypatch):
+        import plistlib
+        monkeypatch.delenv("CODEBUDDY_DEVICE_TOKEN", raising=False)
+        plist_path = tmp_path / "com.workbuddy.workbuddy.plist"
+        plist_path.write_bytes(plistlib.dumps({"a": "b", "n": 1}, fmt=plistlib.FMT_BINARY))
+        assert find_device_token(scan_dirs=[], plists=[plist_path]) is None
+
     def test_env_var_has_highest_priority(self, tmp_path, monkeypatch):
         fake = tmp_path / "disk.bin"
         fake.write_bytes(TOKEN_OTHER.encode())
         monkeypatch.setenv("CODEBUDDY_DEVICE_TOKEN", TOKEN_LONG)
-        result = find_device_token(scan_dirs=[tmp_path])
+        result = find_device_token(scan_dirs=[tmp_path], plists=[])
         assert result is not None
         assert result["token"] == TOKEN_LONG
         assert result["source"] == "env:CODEBUDDY_DEVICE_TOKEN"
@@ -59,7 +81,7 @@ class TestFindDeviceToken:
         empty = tmp_path / "empty"
         empty.mkdir()
         scanned = []
-        result = find_device_token(scan_dirs=[empty], scanned=scanned)
+        result = find_device_token(scan_dirs=[empty], scanned=scanned, plists=[])
         assert result is None
         assert scanned  # 记录了已扫描目录供人工排查
 
@@ -67,7 +89,7 @@ class TestFindDeviceToken:
         fake = tmp_path / "disk.bin"
         fake.write_bytes(TOKEN_LONG.encode())
         monkeypatch.setenv("CODEBUDDY_DEVICE_TOKEN", "not-a-token")
-        result = find_device_token(scan_dirs=[tmp_path])
+        result = find_device_token(scan_dirs=[tmp_path], plists=[])
         assert result is not None
         assert result["token"] == TOKEN_LONG
         assert result["source"] == str(fake)
@@ -82,14 +104,14 @@ class TestFindDeviceToken:
         conn.commit()
         conn.close()
         scanned = []
-        result = find_device_token(db=db, scan_dirs=[], scanned=scanned)
+        result = find_device_token(db=db, scan_dirs=[], scanned=scanned, plists=[])
         assert result is not None
         assert result["token"] == TOKEN_LONG
         assert result["source"].startswith(f"sqlite:{db}#")
 
     def test_missing_db_and_dirs_returns_none(self, tmp_path, monkeypatch):
         monkeypatch.delenv("CODEBUDDY_DEVICE_TOKEN", raising=False)
-        result = find_device_token(db=tmp_path / "nope.vscdb", scan_dirs=[tmp_path / "nope"])
+        result = find_device_token(db=tmp_path / "nope.vscdb", scan_dirs=[tmp_path / "nope"], plists=[])
         assert result is None
 
     def test_coerce_token_value(self, tmp_path):

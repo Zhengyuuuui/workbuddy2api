@@ -144,6 +144,7 @@ import json
 import mmap
 import os
 import pathlib
+import plistlib
 import re
 import sqlite3
 import subprocess
@@ -155,12 +156,32 @@ from typing import Any
 TOKEN_RE = re.compile(rb"v3:[A-Za-z0-9+/=]{100,}")
 MIN_TOKEN_PREFIX = "v3:"
 
+_HOME = pathlib.Path.home()
+
+# 目录扫描点：国内 CodeBuddy + 海外 WorkBuddy 数据目录
 DEFAULT_SCAN_DIRS = [
-    pathlib.Path.home() / "Library" / "Application Support" / "CodeBuddy CN",
-    pathlib.Path.home() / ".codebuddy",
-    pathlib.Path.home() / "workbuddy" / "app",
-    pathlib.Path.home() / "Library" / "Application Support" / "WorkBuddy",
+    _HOME / "Library" / "Application Support" / "CodeBuddy CN",
+    _HOME / ".codebuddy",
+    _HOME / "workbuddy" / "app",
+    _HOME / ".workbuddy",
+    _HOME / "Library" / "Application Support" / "WorkBuddy",
+    _HOME / "Library" / "Application Support" / "WorkBuddy AI",
 ]
+
+# macOS Preferences plist（二进制格式，用 plistlib 解析后递归搜索 v3: 值）。
+# 海外 WorkBuddy（com.tencent.workbuddy.mac，channelId 400101）优先；
+# 国内 CodeBuddy（com.tencent.codebuddycn*，channelId 109137）作对照。
+DEFAULT_PLIST_PATHS = [
+    _HOME / "Library" / "Preferences" / "com.tencent.workbuddy.mac.plist",
+    _HOME / "Library" / "Preferences" / "com.workbuddy.workbuddy.plist",
+    _HOME / "Library" / "Preferences" / "com.workbuddy.workbuddy-ai.plist",
+    _HOME / "Library" / "Preferences" / "com.tencent.codebuddycn.helper.plist",
+    _HOME / "Library" / "Preferences" / "com.tencent.codebuddycn.plist",
+]
+
+# 说明：macOS Keychain 中的 turingshield 条目（com.turingshield.identifying.*）为
+# NSKeyedArchiver 归档的票据元数据，且读取 secret 会触发 GUI 授权弹窗；
+# 命令行默认无权限、且无 v3: 明文，故不做 Keychain 探测。
 
 SKIP_DIR_NAMES = {"Cache", "CachedData", "CrashReport", "GPUCache"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -255,6 +276,45 @@ def _scan_directory(root: pathlib.Path, scanned: list[str]) -> tuple[str | None,
     return None, None
 
 
+def _search_plist_value(value: Any) -> str | None:
+    """递归搜索 plist 值中的 v3: token（str 直接匹配，bytes/归档 blob 走二进制正则）。"""
+    if isinstance(value, str):
+        if _is_valid_token(value):
+            return value
+        return _scan_bytes_for_token(value.encode("utf-8", "replace"))
+    if isinstance(value, (bytes, bytearray)):
+        return _scan_bytes_for_token(bytes(value))
+    if isinstance(value, dict):
+        for item in value.values():
+            hit = _search_plist_value(item)
+            if hit:
+                return hit
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            hit = _search_plist_value(item)
+            if hit:
+                return hit
+    return None
+
+
+def _scan_plist_file(path: pathlib.Path, scanned: list[str]) -> tuple[str | None, str | None]:
+    """只读解析 macOS Preferences plist（多为二进制格式），搜索 v3: 值。"""
+    scanned.append(f"plist:{path}")
+    if not path.is_file():
+        scanned.append(f"plist:{path} (missing)")
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            obj = plistlib.load(f)
+    except (OSError, ValueError, plistlib.InvalidFileException) as exc:
+        scanned.append(f"plist:{path} (parse skipped: {exc})")
+        return None, None
+    token = _search_plist_value(obj)
+    if token:
+        return token, f"plist:{path}"
+    return None, None
+
+
 def _try_decrypt_safe_storage_hint() -> str:
     """secret:// 值多为 VSCode safeStorage 加密（v10/v11 前缀）。
     纯标准库无法 AES 解密；尝试用 macOS security 读密钥仅作可行性探测（超时/弹窗即放弃）。
@@ -330,10 +390,11 @@ def find_device_token(
     scan_dirs: list[pathlib.Path] | None = None,
     scanned: list[str] | None = None,
     env: dict | None = None,
+    plists: list[pathlib.Path] | None = None,
 ) -> dict | None:
     """探测 device token，找到第一个即返回 {"token","source","found_at"}，找不到返回 None。
 
-    优先级：环境变量 CODEBUDDY_DEVICE_TOKEN > --db sqlite > 目录递归扫描。
+    优先级：环境变量 CODEBUDDY_DEVICE_TOKEN > --db sqlite > Preferences plist > 目录递归扫描。
     绝不抛异常；探测过程追加进 scanned（供 CLI 输出人工排查）。
     """
     scanned = scanned if scanned is not None else []
@@ -353,7 +414,14 @@ def find_device_token(
         if hit[0]:
             return _make_result(hit[0], hit[1])
 
-    # c/d. 目录递归扫描（CodeBuddy CN + ~/.codebuddy + WorkBuddy 数据目录）
+    # c. macOS Preferences plist（海外 WorkBuddy 优先）
+    plist_paths = plists if plists is not None else DEFAULT_PLIST_PATHS
+    for p in plist_paths:
+        hit = _scan_plist_file(pathlib.Path(p).expanduser(), scanned)
+        if hit[0]:
+            return _make_result(hit[0], hit[1])
+
+    # d. 目录递归扫描（CodeBuddy CN + ~/.codebuddy + WorkBuddy 数据目录）
     dirs = scan_dirs if scan_dirs is not None else DEFAULT_SCAN_DIRS
     for d in dirs:
         hit = _scan_directory(pathlib.Path(d).expanduser(), scanned)
