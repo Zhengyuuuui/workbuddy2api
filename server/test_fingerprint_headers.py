@@ -194,6 +194,9 @@ class _FakeResp:
     async def aread(self):
         return b""
 
+    async def aclose(self):
+        return None
+
     async def aiter_lines(self):
         yield 'data: {"id":"c1","choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}],"usage":{}}'
         yield "data: [DONE]"
@@ -238,14 +241,14 @@ class TestIntlOfficialHeaderParity:
     def captured(self, tmp_path, monkeypatch):
         requests = []
 
-        def _fake_send(self, request, *, stream=False, **kwargs):
+        async def _fake_send(self, request, *, stream=False, **kwargs):
             requests.append({
                 "method": request.method,
                 "url": str(request.url),
                 "headers": request.headers,
                 "content": request.content,
             })
-            return _FakeStreamCM()
+            return _FakeResp()
 
         monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
         state = _make_state(tmp_path, platform="workbuddy-ai")
@@ -290,13 +293,32 @@ class TestIntlOfficialHeaderParity:
         assert headers["x-request-id"] == headers["x-conversation-message-id"]
         assert headers["x-request-id"] != headers["x-conversation-request-id"]
 
+    def test_trace_headers_same_origin(self, captured):
+        """OPtel 头必须同源：traceparent/b3/X-Trace-ID/X-B3-TraceId/X-Root-Request-ID。
+
+        逆向结论（xiaofan6ya §10.9）：同一请求里出现两个不同 traceId 是自相矛盾的
+        特征，比不发更糟。本断言为纯本地内存校验，不发起任何网络请求。
+        """
+        self._post_intl()
+        headers = captured[0]["headers"]
+        trace_id = headers["x-b3-traceid"]
+        span_id = headers["x-b3-spanid"]
+        assert headers["x-trace-id"] == trace_id
+        assert headers["traceparent"] == f"00-{trace_id}-{span_id}-01"
+        assert headers["b3"] == f"{trace_id}-{span_id}-1"
+        assert headers["x-b3-sampled"] == "1"
+        assert HEX32.match(trace_id), trace_id
+        assert HEX16.match(span_id), span_id
+        # 国际版：root/request/conversation-request 三层同源
+        assert headers["x-root-request-id"] == headers["x-conversation-request-id"]
+
 
 class TestForwardChatFingerprint:
     @pytest.fixture()
     def captured(self, tmp_path, monkeypatch):
         requests = []
 
-        def _fake_send(self, request, *, stream=False, **kwargs):
+        async def _fake_send(self, request, *, stream=False, **kwargs):
             requests.append({
                 "method": request.method,
                 "url": str(request.url),
@@ -304,7 +326,7 @@ class TestForwardChatFingerprint:
                 "content": request.content,
                 "kwargs": kwargs,
             })
-            return _FakeStreamCM()
+            return _FakeResp()
 
         monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
         state = _make_state(tmp_path)

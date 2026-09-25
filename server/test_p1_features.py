@@ -185,6 +185,9 @@ class _FakeResp:
         if self._exc is not None:
             raise self._exc
 
+    async def aclose(self):
+        return None
+
 
 class _FakeStreamCM:
     def __init__(self, resp):
@@ -242,14 +245,14 @@ class Harness:
 def harness(tmp_path, monkeypatch):
     h = Harness(tmp_path)
 
-    def _fake_send(self, request, *, stream=False, **kwargs):
+    async def _fake_send(self, request, *, stream=False, **kwargs):
         if h.script:
             lines, exc = h.script.pop(0)
         else:
             lines, exc = ["data: [DONE]"], None
         h.captured.append({"method": request.method, "url": str(request.url),
                            "headers": request.headers, "content": request.content})
-        return _FakeStreamCM(_FakeResp(lines, exc))
+        return _FakeResp(lines, exc)
 
     monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
     h.set_state(h.make_state())

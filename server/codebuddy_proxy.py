@@ -1318,7 +1318,10 @@ async def stream_upstream(
                 client.build_request("POST", url, headers=request_headers, content=payload),
                 state.client.platform,
             )
-            async with client.send(upstream_request, stream=True) as resp:
+            # httpx 的 send() 是协程：await 后手动 aclose（stream=True 必须关，
+            # 否则连接与 SSE 缓冲区不会释放）。不能用 async with 包 send()。
+            resp = await client.send(upstream_request, stream=True)
+            try:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", "replace")
@@ -1546,7 +1549,10 @@ async def stream_upstream(
                 
                 elif protocol == "openai":
                     yield b"data: [DONE]\n\n"
-    
+
+            finally:
+                await resp.aclose()
+
     except httpx.TimeoutException as exc:
         # 【日志】超时
         diagnostic("stream_timeout", protocol=protocol, chunks=chunk_count,
@@ -1628,7 +1634,8 @@ async def collect_upstream(
                 client.build_request("POST", url, headers=request_headers, content=payload),
                 state.client.platform,
             )
-            async with client.send(upstream_request, stream=True) as resp:
+            resp = await client.send(upstream_request, stream=True)
+            try:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", "replace")
@@ -1717,8 +1724,11 @@ async def collect_upstream(
                                 if tc.get("function", {}).get("name"):
                                     tool_calls_dict[idx]["function"]["name"] = tc["function"]["name"]
                                 if tc.get("function", {}).get("arguments"):
-                                    tool_calls_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
-    
+                                    tool_calls_dict[idx]["function"]["arguments"] += tc.get("function", {}).get("arguments")
+
+            finally:
+                await resp.aclose()
+
     except httpx.HTTPError as exc:
         diagnostic("upstream_error", protocol=protocol, error=str(exc))
         raise HTTPException(status_code=502, detail={"error": {"message": f"upstream error: {exc}", "type": "upstream_error"}})

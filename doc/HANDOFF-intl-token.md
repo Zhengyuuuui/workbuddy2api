@@ -177,3 +177,39 @@ def response(flow: http.HTTPFlow) -> None:
 - hosts 条目已清、pf rdr 已清、mitmdump×2 + 看门狗×2 已杀
 - `~/.workbuddy-ai/system-ca-bundle.pem`（mitm CA）**已删除**
 - 两个 bridge：8787（国内，uptime 连续未动）/ 8788（国际，伪装头新版）
+
+## 八、外部项目交叉验证（2026-09-25，ardeyouxipianyi/workbuddy2api-hub + xiaofan6ya/workbuddy2api）
+
+两家独立项目的逆向结论与本仓库互相印证：
+
+- **xiaofan6ya §10.9.1**：Turing SDK 对 HTTP 只暴露 `X-Device-Token`／
+  `X-Device-Token-Error` 两个互斥头，无任何 `X-Turing-*` 签名头，token 是
+  原生 DLL 采集硬件指纹后换取的**不透明字符串**，纯 Python 无法复刻；官方
+  客户端自带"未配置就降级"路径，**不发该头不算异常**
+- 其 §10.9 与我们一样用**反向断言测试**锁死官方头型
+  （`test_client_header_shape_matches_official`），并强调 traceparent/b3/
+  X-Trace-ID **必须同源**，"发得不一致比不发更糟"——已落地为
+  `TestIntlOfficialHeaderParity::test_trace_headers_same_origin`
+- **hub v1.5.0** 修正记录：官方是 `X-Product: SaaS`（自创值会被识别），与
+  我们 t006 抓包一致；hub 另确认 `www.codebuddy.ai` 无法解析、国际版 CLI
+  身份也只能走 `www.workbuddy.ai`
+- 两家都**刻意不做跨区域同名模型混合轮询**（指纹对齐 + 防关联考量），与
+  本仓库双 bridge 物理隔离一致
+- 注意：他们的 `X-Private-Data:false` / `Accept-Language:zh-CN` 是**国内
+  5.5.6 CLI 身份**观测，与本国际版抓包不同，**不照抄**
+
+## 九、生产事故记录：httpx `send()` 不是上下文管理器（2026-09-25）
+
+- 现象：唯一一次真实请求返回空 body，日志 `TypeError: 'coroutine' object
+  does not support the asynchronous context manager protocol`
+- 根因：`httpx.AsyncClient.send()` 是协程（返回需 await 的 Response），
+  **不支持 `async with`**；必须 `resp = await client.send(req, stream=True)`
+  后 `try/finally: await resp.aclose()` 手动关闭。为剥离 accept-encoding 从
+  `client.stream()` 改 `build_request + send` 时踩中
+- 教训：mock 必须镜像真实库语义——本仓库测试 fake 曾用同步函数返回 CM，
+  与真实 httpx 不一致，导致 104 个测试全过但生产即挂。现已改为 async
+  send + 带 `aclose` 的 fake，并用本地假上游服务器（127.0.0.1）验证过
+  真实 httpx 的 await+aclose 流式机制后才发真实请求
+- 该 TypeError 在任何网络 I/O 之前抛出，**上游零请求、账号零接触**
+- 另一教训：后台进程必须 double-fork（`/tmp/daemon8788.py`），普通
+  `nohup &` 会被工具会话的 SIGHUP 带走（本仓库历史上第 4 次踩坑）

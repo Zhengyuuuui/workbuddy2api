@@ -236,6 +236,9 @@ class _FakeResp:
         if self._exc is not None:
             raise self._exc
 
+    async def aclose(self):
+        return None
+
 
 class _FakeStreamCM:
     def __init__(self, resp):
@@ -341,19 +344,19 @@ class Harness:
 def harness(tmp_path, monkeypatch):
     h = Harness(tmp_path)
 
-    def _fake_send(self, request, *, stream=False, **kwargs):
+    async def _fake_send(self, request, *, stream=False, **kwargs):
         if h.script:
             cfg = h.script.pop(0)
         else:
             cfg = {"status": 200, "lines": ["data: [DONE]"]}
         h.captured.append({"method": request.method, "url": str(request.url),
                            "headers": request.headers, "content": request.content})
-        return _FakeStreamCM(_FakeResp(
+        return _FakeResp(
             lines=cfg.get("lines") or (),
             exc=cfg.get("exc"),
             status_code=cfg.get("status", 200),
             body=cfg.get("body", b""),
-        ))
+        )
 
     async def _fake_post(self, url, *args, **kwargs):
         h.billing_calls.append(str(url))
