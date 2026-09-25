@@ -4,13 +4,14 @@
 
 ## 🔧 官方客户端指纹模拟
 
-代理请求默认模拟官方 CodeBuddy IDE 的请求特征，避免因流量特征与官方客户端差异过大而触发平台风控（参考[踩坑记录](doc/incident-postmortem-and-hardening-checklist.md)）：
+代理请求默认模拟官方客户端的请求特征，避免因流量特征与官方客户端差异过大而触发平台风控（参考[踩坑记录](doc/incident-postmortem-and-hardening-checklist.md)）：
 
-- 请求头对齐官方 `CodeBuddyIDE/4.12.0`（UA、x-ide-*、x-product-* 等）
+- 请求头按平台对齐官方客户端：国内 `CodeBuddyIDE/4.12.0`（UA、x-ide-*、x-product-* 等）；海外 `WorkBuddy/5.5.2 ... CLI/2.137.1`（x-ide-*、x-product: SaaS、x-stainless-* 等）
 - 会话级 conversation_id 复用，previous_response_id 随会话链式传递
 - b3 追踪链同会话延续；大请求体自动 gzip；max_tokens 与官方一致
-- `x-device-token` 支持通过环境变量 / `--device-token` 注入（获取方式见[抓包手册](doc/mitm-capture-playbook.md)）
-- 设备指纹获取：按[抓包手册 §7](doc/mitm-capture-playbook.md) 自行抓取（一设备一账号，勿共用）
+- 国际版发送头为官方真实抓包头集的**子集**：不发送 x-model-id、x-request-trace-id、accept-language、sec-fetch-mode、monitor_httpsendtime、acp-connection-id，并剥离 httpx 默认注入的 accept-encoding——由 `server/test_fingerprint_headers.py::TestIntlOfficialHeaderParity` 回归锁定，官方没有的头绝不会出现
+- 国内版 `x-device-token`：通过环境变量 / `--device-token` 注入（获取方式见[抓包手册](doc/mitm-capture-playbook.md)；一设备一账号，勿共用）
+- 海外版 **不存在** `x-device-token`：官方客户端本身不产该头（已三轮抓包 + 二进制层验证，详见[交接文档](doc/HANDOFF-intl-token.md)），仅需 JWT 认证，无需也无法注入 token
 
 ## 项目简介
 
@@ -251,9 +252,11 @@ model_provider = "codebuddy"
 --no-browser             登录时不打开浏览器
 --verbose-llm            记录完整请求/响应内容（默认仅摘要）
 --mock-dir DIR           使用 mock 数据（测试用）
---device-token PATH      x-device-token 注入：裸 token / JSON 文件路径
+--device-token PATH      x-device-token 注入（仅国内版有效）：裸 token / JSON 文件路径
                          （也可用环境变量 CODEBUDDY_DEVICE_TOKEN；
-                           获取方式见 doc/mitm-capture-playbook.md §7）
+                           获取方式见 doc/mitm-capture-playbook.md §7。
+                           海外版客户端不产 x-device-token，此参数对
+                           workbuddy-ai 平台无效）
 --rate-qps FLOAT         全局限速：持续 QPS（默认 1.0，0 不限速）
 --rate-burst INT         全局限速：突发容量（默认 5，超出排队）
 --rate-jitter FLOAT      每请求随机抖动上限（秒，默认 3.0，0 关闭）
@@ -431,6 +434,7 @@ proxy 已自动处理（会自动补 system 首条消息），如仍有问题请
 - **并发**: 支持 1000+ 并发请求
 - **流式**: 完整的流式日志（started / progress / completed / timeout）
 - **认证协议**: `cli-external-link`（浏览器 SSO 登录 → 轮询 token → 自动刷新）
+- **请求头指纹**: 按平台对齐真实抓包（国内 CodeBuddyIDE/4.12.0、海外 WorkBuddy/5.5.2）；海外版仅发送官方头集子集的头，httpx 默认的 accept-encoding 在发送前剥离，避免任何非指纹头被上游侧记录
 
 ## 测试
 
@@ -440,9 +444,9 @@ uv run pytest server/test_*.py -v
 
 ## 多用户安全须知
 
-- **一设备一账号**：`x-device-token` 与账号是「设备 + 账号」绑定关系。多个账号共用同一个 token 会被平台做**设备关联**，触发连坐封号——每台设备只能用自己的 token
-- token / session 文件位于 `~/.codebuddy-device-token.json` 与 `~/.codebuddy-session.json`（已被 `.gitignore` 的 `*device-token*.json`、`*session*.json` 规则排除，**不会入库**）
-- 请勿分享自己的 token，也请勿使用他人分享的 token——被关联的是一整台设备，换号也救不回来
+- **一设备一账号**（仅国内版）：国内 `x-device-token` 与账号是「设备 + 账号」绑定关系。多个账号共用同一个 token 会被平台做**设备关联**，触发连坐封号——每台设备只能用自己的 token。海外版无 device token，不涉及此约束
+- 国内 token / session 文件位于 `~/.codebuddy-device-token.json` 与 `~/.codebuddy-session.json`（已被 `.gitignore` 的 `*device-token*.json`、`*session*.json` 规则排除，**不会入库**）
+- 请勿分享自己的国内 token，也请勿使用他人分享的 token——被关联的是一整台设备，换号也救不回来
 
 ## 免责声明
 

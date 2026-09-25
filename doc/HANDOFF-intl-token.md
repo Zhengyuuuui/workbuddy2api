@@ -133,3 +133,47 @@ def response(flow: http.HTTPFlow) -> None:
 1. 先跑第三节自测命令，四个全绿再碰 App——任何一步红了不要推进，先修
 2. mitmdump 是前台进程，终端一关就死，这就是之前所有 3002 的原因
 3. 用户已不满，全程用"已验证事实"说话，每个动作前先自测并汇报结果
+
+---
+
+## 七、最终结论（2026-09-25，三轮抓包审计后定稿）
+
+### 7.1 国际版 x-device-token：确认不存在，任务关闭
+
+三轮完整抓包（00:28、02:24、02:26，含 t006 实测报文）结论一致：
+
+- `/v2/chat/completions` 请求头**从不携带** `x-device-token`，也从不携带
+  `X-Device-Token-Error`；全部 113 条 addon 记录中带 token 的 0 条
+- 唯一授权方式是 JWT Bearer（claims 无任何设备字段）
+- App 日志每轮都是同一条：`[TuringSdk] device token fetch failed /
+  TuringShield standardService is unavailable`
+- 二进制层根因（已 RE 验证）：turing 节点的 serverURL 全局变量
+  （+0x965f8）只由 `setupTMFHTTPServer:` 写入，而该函数**零调用者**；
+  国内节点（协议=5）跳过这个返回 nil 的 standardService，所以国内能用
+- 结论：这不是抓包姿势问题，是官方客户端本身拿不到。**不要再尝试抓取。**
+
+### 7.2 最终方案：头指纹伪装（已上线 8788 并回归测试）
+
+国际版 chat 请求头**100% 对齐官方真实抓包**（三轮审计，最终端到端实测
+38 项头全部 ⊆ 官方头集，零多余头）：
+
+- User-Agent: `WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1`
+  （x-stainless-runtime=node/v22.21.1 同源）
+- X-IDE-Name/Type: WorkBuddy；X-IDE-Version: 5.5.2（国内 4.12.0）
+- X-Product: SaaS（t006 实测官方会带，无 x-product-code/version/env-id）
+- X-Request-ID **与 X-Conversation-Message-ID 同值**（国际版特性；国内与
+  request-id 同值），代码按平台分支
+- 国际版**不发**：x-model-id、x-request-trace-id、accept-language、
+  sec-fetch-mode、monitor_httpsendtime、x-device-token
+- httpx 默认注入的 `accept-encoding` 在国际版发送前剥离
+  （`_strip_http_framework_noise()`，官方 undici 不发）
+- 唯一已知缺口：`acp-connection-id`（无真实 ACP 值，伪造风险 > 收益）
+
+回归测试锁定：`test_fingerprint_headers.py::TestIntlOfficialHeaderParity`
+（官方头集白名单 + 禁发名单 + 值断言，共 103 测试全过）。
+
+### 7.3 抓包环境已全部拆除（safety checklist）
+
+- hosts 条目已清、pf rdr 已清、mitmdump×2 + 看门狗×2 已杀
+- `~/.workbuddy-ai/system-ca-bundle.pem`（mitm CA）**已删除**
+- 两个 bridge：8787（国内，uptime 连续未动）/ 8788（国际，伪装头新版）

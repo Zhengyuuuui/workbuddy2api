@@ -242,16 +242,16 @@ class Harness:
 def harness(tmp_path, monkeypatch):
     h = Harness(tmp_path)
 
-    def _fake_stream(self, method, url, headers=None, content=None, **kwargs):
+    def _fake_send(self, request, *, stream=False, **kwargs):
         if h.script:
             lines, exc = h.script.pop(0)
         else:
             lines, exc = ["data: [DONE]"], None
-        h.captured.append({"method": method, "url": url,
-                           "headers": dict(headers or {}), "content": content})
+        h.captured.append({"method": request.method, "url": str(request.url),
+                           "headers": request.headers, "content": request.content})
         return _FakeStreamCM(_FakeResp(lines, exc))
 
-    monkeypatch.setattr(httpx.AsyncClient, "stream", _fake_stream)
+    monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
     h.set_state(h.make_state())
     yield h
     codebuddy_proxy.proxy_state = None

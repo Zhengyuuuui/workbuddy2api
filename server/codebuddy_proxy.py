@@ -337,6 +337,9 @@ def get_state() -> ProxyState:
 # ============================================================================
 
 OFFICIAL_IDE_VERSION = "4.12.0"
+# 国际版官方客户端指纹（2026-09-25 mitm 抓包实测，见 doc/HANDOFF-intl-token.md）
+INTL_IDE_VERSION = "5.5.2"
+INTL_CLIENT_UA = f"WorkBuddy/{INTL_IDE_VERSION} WorkBuddy/{INTL_IDE_VERSION} CLI/2.137.1"
 
 
 def _hex32() -> str:
@@ -537,32 +540,61 @@ class UpstreamCircuitBreaker:
 
 
 def official_ide_headers(model: str, conversation_id: str, platform: str, device_token: str = "") -> dict:
-    """构造官方 IDE 指纹 headers。
+    """构造官方客户端指纹 headers。
 
-    platform 为 "workbuddy-ai" 时 x-domain 用 www.workbuddy.ai，
-    否则 www.codebuddy.cn。ide-name/type 保持 CodeBuddyIDE。
+    platform == "workbuddy-ai" 时按国际版官方 WorkBuddy AI chat 抓包指纹伪装：
+    User-Agent: WorkBuddy/5.5.2 WorkBuddy/5.5.2 CLI/2.137.1，
+    x-ide-name/type: WorkBuddy，x-ide-version: 5.5.2，
+    不发送 CN 特有的 x-product-code/x-product-version/x-env-id/x-model-id。
+    x-product: SaaS 保留（官方 intl chat 实测会带，2026-09-25 t006 报文头）。
+    否则按国内 CodeBuddyIDE/4.12.0 指纹（x-domain www.codebuddy.cn）。
 
-    x-device-token 预留接口：下阶段由提取脚本注入，本阶段为空时不发送。
+    x-device-token 预留接口：国际版官方客户端本身不发送该头（TuringShield
+    standardService 不可用，见 doc/HANDOFF-intl-token.md），为空时不发送。
     """
-    domain = "www.workbuddy.ai" if platform == "workbuddy-ai" else "www.codebuddy.cn"
-    headers = {
-        "user-agent": f"CodeBuddyIDE/{OFFICIAL_IDE_VERSION} CodeBuddy/{OFFICIAL_IDE_VERSION}",
-        "accept": "*/*",
-        "accept-language": "*",
-        "sec-fetch-mode": "cors",
-        "x-requested-with": "XMLHttpRequest",
-        "x-ide-name": "CodeBuddyIDE",
-        "x-ide-type": "CodeBuddyIDE",
-        "x-ide-version": OFFICIAL_IDE_VERSION,
-        "x-product": "SaaS",
-        "x-product-code": "codebuddy",
-        "x-product-version": OFFICIAL_IDE_VERSION,
-        "x-env-id": "production",
-        "x-domain": domain,
-        "x-agent-intent": "craft",
-        "x-model-id": model,
-        "x-conversation-id": conversation_id,
-    }
+    if platform == "workbuddy-ai":
+        headers = {
+            "user-agent": INTL_CLIENT_UA,
+            "accept": "application/json",
+            "x-requested-with": "XMLHttpRequest",
+            "x-ide-name": "WorkBuddy",
+            "x-ide-type": "WorkBuddy",
+            "x-ide-version": INTL_IDE_VERSION,
+            "x-domain": "www.workbuddy.ai",
+            "x-agent-intent": "craft",
+            "x-agent-purpose": "conversation",
+            "x-agent-type": "main",
+            "x-private-data": "true",
+            "x-codebuddy-request": "1",
+            "x-product": "SaaS",
+            "x-conversation-id": conversation_id,
+            "x-stainless-arch": "arm64",
+            "x-stainless-lang": "js",
+            "x-stainless-os": "MacOS",
+            "x-stainless-package-version": "6.25.0",
+            "x-stainless-retry-count": "0",
+            "x-stainless-runtime": "node",
+            "x-stainless-runtime-version": "v22.21.1",
+        }
+    else:
+        headers = {
+            "user-agent": f"CodeBuddyIDE/{OFFICIAL_IDE_VERSION} CodeBuddy/{OFFICIAL_IDE_VERSION}",
+            "accept": "*/*",
+            "accept-language": "*",
+            "sec-fetch-mode": "cors",
+            "x-requested-with": "XMLHttpRequest",
+            "x-ide-name": "CodeBuddyIDE",
+            "x-ide-type": "CodeBuddyIDE",
+            "x-ide-version": OFFICIAL_IDE_VERSION,
+            "x-product": "SaaS",
+            "x-product-code": "codebuddy",
+            "x-product-version": OFFICIAL_IDE_VERSION,
+            "x-env-id": "production",
+            "x-domain": "www.codebuddy.cn",
+            "x-agent-intent": "craft",
+            "x-model-id": model,
+            "x-conversation-id": conversation_id,
+        }
     if device_token:
         headers["x-device-token"] = device_token
     return headers
@@ -579,6 +611,20 @@ def _prepare_upstream_payload(body: dict[str, Any]) -> tuple[bytes, dict]:
     """序列化上游 body，超过阈值时 gzip（返回 (payload, extra_headers)）。"""
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     return gzip_body_if_large(raw)
+
+
+def _strip_http_framework_noise(request: httpx.Request, platform: str) -> httpx.Request:
+    """国际版：删掉 httpx 默认注入的 accept-encoding（官方 intl chat 头里没有）。
+
+    官方抓包（mitm，2026-09-25）显示 x-stainless-runtime=node/undici 不发
+    accept-encoding；python-httpx 默认会注入 "gzip, deflate"。为头集 100% 对齐
+    官方、避免任何非指纹头被上游侧记录，国际版发送前剥离。国内版不动。
+    """
+    if platform == "workbuddy-ai":
+        request.headers = httpx.Headers(
+            [(k, v) for k, v in request.headers.raw if k.lower() != b"accept-encoding"]
+        )
+    return request
 
 
 def _extract_upstream_response_id(chunk: dict[str, Any]) -> str | None:
@@ -1130,36 +1176,65 @@ async def forward_chat(
     trace_id = state.get_trace_id(conv_id)
     span_id = _hex16()
     
+    if state.client.platform == "workbuddy-ai":
+        # 国际版：对齐官方 chat 抓包指纹（WorkBuddy/5.5.2，2026-09-25 两次实测）
+        client_headers = {
+            "user-agent": INTL_CLIENT_UA,
+            "x-ide-name": "WorkBuddy",
+            "x-ide-type": "WorkBuddy",
+            "x-ide-version": INTL_IDE_VERSION,
+            "x-agent-intent": "craft",
+            "x-agent-purpose": "conversation",
+            "x-agent-type": "main",
+            "x-private-data": "true",
+            "x-codebuddy-request": "1",
+            "x-product": "SaaS",
+            "x-conversation-id": conv_id,
+            "accept": "application/json",
+        }
+    else:
+        # 国内：CodeBuddyIDE/4.12.0 指纹（不引入行为变化）
+        client_headers = {
+            "user-agent": f"CodeBuddyIDE/{OFFICIAL_IDE_VERSION} CodeBuddy/{OFFICIAL_IDE_VERSION}",
+            "x-ide-name": "CodeBuddyIDE",
+            "x-ide-type": "CodeBuddyIDE",
+            "x-ide-version": OFFICIAL_IDE_VERSION,
+            "x-product": "SaaS",
+            "x-product-code": "codebuddy",
+            "x-product-version": OFFICIAL_IDE_VERSION,
+            "x-env-id": "production",
+            "x-agent-intent": "craft",
+            "x-model-id": model,
+            "x-conversation-id": conv_id,
+        }
+
     base_headers = {
         **state.client.auth_headers(),
         "Content-Type": "application/json",
-        "user-agent": f"CodeBuddyIDE/{OFFICIAL_IDE_VERSION} CodeBuddy/{OFFICIAL_IDE_VERSION}",
-        "x-ide-name": "CodeBuddyIDE",
-        "x-ide-type": "CodeBuddyIDE",
-        "x-ide-version": OFFICIAL_IDE_VERSION,
-        "x-product": "SaaS",
-        "x-product-code": "codebuddy",
-        "x-product-version": OFFICIAL_IDE_VERSION,
-        "x-env-id": "production",
-        "x-agent-intent": "craft",
-        "x-model-id": model,
-        "x-conversation-id": conv_id,
+        **client_headers,
         "x-conversation-message-id": msg_id,
         "x-conversation-request-id": req_id,
-        "x-request-id": req_id,
-        "x-request-trace-id": str(uuid.uuid4()),
+        # 官方国际版 chat：X-Request-ID 与 X-Conversation-Message-ID 同值；
+        # 国内版：X-Request-ID 与 X-Conversation-Request-ID 同值。按平台对齐。
+        "x-request-id": msg_id if state.client.platform == "workbuddy-ai" else req_id,
         "x-b3-traceid": trace_id,
         "x-b3-spanid": span_id,
         "x-b3-parentspanid": state.get_parent_span_id(conv_id, span_id),
         "x-b3-sampled": "1",
         "b3": f"{trace_id}-{span_id}-1",
         "x-trace-id": trace_id,
+        "traceparent": f"00-{trace_id}-{span_id}-01",
+        "x-root-request-id": req_id,
         "x-requested-with": "XMLHttpRequest",
-        "accept": "*/*",
-        "sec-fetch-mode": "cors",
-        "monitor_httpsendtime": str(int(time.time() * 1000)),
     }
+    if state.client.platform != "workbuddy-ai":
+        # 国内独有头（国际版官方 chat 不带这些，不加）
+        base_headers["accept"] = "*/*"
+        base_headers["sec-fetch-mode"] = "cors"
+        base_headers["monitor_httpsendtime"] = str(int(time.time() * 1000))
+        base_headers["x-request-trace-id"] = str(uuid.uuid4())
     # 合并指纹 headers：跳过与 base_headers 大小写冲突的键（避免 httpx 双发拼接）
+    # 注：finger_headers 与 client_headers 的一致，合并后无实际变化，为兼容旧调用路径保留。
     base_keys_lower = {k.lower() for k in base_headers}
     for k, v in finger_headers.items():
         if k.lower() not in base_keys_lower:
@@ -1239,7 +1314,11 @@ async def stream_upstream(
         payload, extra_headers = _prepare_upstream_payload(body)
         request_headers = {**headers, **extra_headers}
         async with httpx.AsyncClient(timeout=timeout_config, trust_env=False) as client:
-            async with client.stream("POST", url, headers=request_headers, content=payload) as resp:
+            upstream_request = _strip_http_framework_noise(
+                client.build_request("POST", url, headers=request_headers, content=payload),
+                state.client.platform,
+            )
+            async with client.send(upstream_request, stream=True) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", "replace")
@@ -1545,7 +1624,11 @@ async def collect_upstream(
         payload, extra_headers = _prepare_upstream_payload(body)
         request_headers = {**headers, **extra_headers}
         async with httpx.AsyncClient(timeout=timeout_config, trust_env=False) as client:
-            async with client.stream("POST", url, headers=request_headers, content=payload) as resp:
+            upstream_request = _strip_http_framework_noise(
+                client.build_request("POST", url, headers=request_headers, content=payload),
+                state.client.platform,
+            )
+            async with client.send(upstream_request, stream=True) as resp:
                 if resp.status_code != 200:
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", "replace")

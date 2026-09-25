@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 import codebuddy_proxy
 from codebuddy_client_demo import CodeBuddyClient
 from codebuddy_proxy import (
+    INTL_IDE_VERSION,
     OFFICIAL_IDE_VERSION,
     ProxyState,
     _hex16,
@@ -206,22 +207,106 @@ class _FakeStreamCM:
         return False
 
 
+class TestIntlOfficialHeaderParity:
+    """国际版最终发送头必须是官方抓包头集的子集（mitm 实测，2026-09-25 t006 报文）。
+
+    官方 /v2/chat/completions 头集（41 项，见 doc/HANDOFF-intl-token.md）：
+    httpx 框架头 host/connection/content-length/accept + content-encoding(gzip 时) 在内，
+    缺的只有 acp-connection-id（我们没有真实 ACP 连接，伪造风险更高，按决策不加）。
+    """
+
+    OFFICIAL_HEADERS = {
+        # httpx 框架层（官方 undici 也有等价头）
+        "host", "connection", "content-length", "accept", "content-encoding",
+        # 业务指纹头
+        "user-agent", "authorization", "x-user-id", "x-domain", "accept",
+        "content-type", "x-requested-with",
+        "x-ide-name", "x-ide-type", "x-ide-version", "x-product",
+        "x-agent-intent", "x-agent-purpose", "x-agent-type",
+        "x-private-data", "x-codebuddy-request",
+        "x-conversation-id", "x-conversation-message-id", "x-conversation-request-id",
+        "x-request-id", "x-root-request-id",
+        "x-stainless-arch", "x-stainless-lang", "x-stainless-os",
+        "x-stainless-package-version", "x-stainless-retry-count",
+        "x-stainless-runtime", "x-stainless-runtime-version",
+        "traceparent", "b3", "x-b3-traceid", "x-b3-spanid",
+        "x-b3-parentspanid", "x-b3-sampled", "x-trace-id",
+        "acp-connection-id",  # 官方有我们没有；允许出现在集合中，宽松计入
+    }
+
+    @pytest.fixture()
+    def captured(self, tmp_path, monkeypatch):
+        requests = []
+
+        def _fake_send(self, request, *, stream=False, **kwargs):
+            requests.append({
+                "method": request.method,
+                "url": str(request.url),
+                "headers": request.headers,
+                "content": request.content,
+            })
+            return _FakeStreamCM()
+
+        monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
+        state = _make_state(tmp_path, platform="workbuddy-ai")
+        monkeypatch.setattr(codebuddy_proxy, "proxy_state", state)
+        yield requests
+        codebuddy_proxy.proxy_state = None
+
+    def _post_intl(self) -> dict:
+        with TestClient(codebuddy_proxy.app) as client:
+            return client.post("/v1/chat/completions", content=json.dumps({
+                "model": "deepseek-v4.1-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+            }), headers={"Content-Type": "application/json"}).json()
+
+    def test_sent_headers_subset_of_official(self, captured):
+        self._post_intl()
+        headers = captured[0]["headers"]
+        extra = sorted(set(headers) - self.OFFICIAL_HEADERS)
+        assert extra == [], f"官方没有的头不允许发送: {extra}"
+
+    def test_no_accept_encoding_noise(self, captured):
+        self._post_intl()
+        headers = captured[0]["headers"]
+        assert "accept-encoding" not in headers
+        for banned in ("x-model-id", "x-product-code", "x-product-version",
+                       "x-env-id", "accept-language", "sec-fetch-mode",
+                       "monitor_httpsendtime", "x-request-trace-id",
+                       "x-device-token", "x-refresh-token"):
+            assert banned not in headers, banned
+
+    def test_intl_fingerprint_values(self, captured):
+        self._post_intl()
+        headers = captured[0]["headers"]
+        assert headers["user-agent"] == f"WorkBuddy/{INTL_IDE_VERSION} WorkBuddy/{INTL_IDE_VERSION} CLI/2.137.1"
+        assert headers["x-ide-name"] == "WorkBuddy"
+        assert headers["x-ide-version"] == INTL_IDE_VERSION
+        assert headers["x-product"] == "SaaS"
+        assert headers["x-agent-purpose"] == "conversation"
+        assert headers["x-stainless-runtime"] == "node"
+        assert INTL_IDE_VERSION == "5.5.2"
+        # 官方行为：X-Request-ID 与 X-Conversation-Message-ID 同值
+        assert headers["x-request-id"] == headers["x-conversation-message-id"]
+        assert headers["x-request-id"] != headers["x-conversation-request-id"]
+
+
 class TestForwardChatFingerprint:
     @pytest.fixture()
     def captured(self, tmp_path, monkeypatch):
         requests = []
 
-        def _fake_stream(self, method, url, headers=None, content=None, **kwargs):
+        def _fake_send(self, request, *, stream=False, **kwargs):
             requests.append({
-                "method": method,
-                "url": url,
-                "headers": dict(headers or {}),
-                "content": content,
+                "method": request.method,
+                "url": str(request.url),
+                "headers": request.headers,  # httpx.Headers：大小写不敏感
+                "content": request.content,
                 "kwargs": kwargs,
             })
             return _FakeStreamCM()
 
-        monkeypatch.setattr(httpx.AsyncClient, "stream", _fake_stream)
+        monkeypatch.setattr(httpx.AsyncClient, "send", _fake_send)
         state = _make_state(tmp_path)
         monkeypatch.setattr(codebuddy_proxy, "proxy_state", state)
         yield requests
