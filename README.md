@@ -53,7 +53,9 @@ workbuddy2api/
 │   ├── desensitize.py               # 脱敏模块
 │   ├── responses_adapter.py         # Responses API 转换
 │   ├── responses_projection.py      # 消息压缩
+│   ├── projection_metadata.py       # 压缩元数据
 │   ├── anthropic_adapter.py         # Anthropic API 转换
+│   ├── extract_device_token.py      # x-device-token 抓取
 │   └── test_*.py                    # 测试
 ├── pyproject.toml
 └── README.md
@@ -170,12 +172,18 @@ model_provider = "codebuddy"
 ```json
 {
   "DeepSeek-V4": {
-    "base_url": "http://127.0.0.1:8787/v1/messages",
+    "base_url": "http://127.0.0.1:8787",
     "api_key": "",
     "model": "deepseek-v4-pro"
   }
 }
 ```
+
+> ⚠️ `base_url` 填到端口即可，**不要带 `/v1/messages`**。CC Switch 会自己拼 `/v1/messages`，
+> 若 base_url 已含该路径会变成 `/v1/messages/v1/messages` 导致 404。
+>
+> proxy 不实现 Anthropic 官方的模型列举接口（`GET /v1/messages` 返回 405），
+> 所以 CC Switch 的"获取模型列表"按钮可能拿不到结果 —— 手动填写 `model` 字段即可正常工作。
 
 #### 其他 OpenAI 兼容客户端
 
@@ -185,7 +193,7 @@ model_provider = "codebuddy"
 
 ## 模型列表
 
-### 国内版 CodeBuddy（19 个）
+### 国内版 CodeBuddy（28 个）
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
@@ -193,6 +201,7 @@ model_provider = "codebuddy"
 | `default` | Default | codebuddy |
 | `hy4-preview` | Hy4 preview | tencent |
 | `hy3` | Hy3 | tencent |
+| `hy3-x` | Hy3 | tencent |
 | `hunyuan-chat` | Hunyuan-Turbos | tencent |
 | `glm-5.3` | GLM-5.3 | zhipu |
 | `glm-5.3-flash` | GLM-5.3-flash | zhipu |
@@ -201,13 +210,21 @@ model_provider = "codebuddy"
 | `glm-5v-turbo` | GLM-5v-Turbo | zhipu |
 | `kimi-k3` | Kimi-K3 | moonshot |
 | `kimi-k3-1` | Kimi-K3.1（未公开发布） | moonshot |
+| `kimi-k2.8-preview` | Kimi-K2.8-Preview | moonshot |
 | `kimi-k2.7` | Kimi-K2.7-Code | moonshot |
 | `kimi-k2.6` | Kimi-K2.6 | moonshot |
 | `minimax-m3` | MiniMax-M3 | minimax |
 | `minimax-m2.7` | MiniMax-M2.7 | minimax |
+| `space-bunny` | Space-Bunny | tencent |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | deepseek |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | deepseek |
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
+| `codewise-default-model-v2` | Default（补全） | tencent |
+| `codewise-completions` | codewise-completions | tencent |
+| `codewise-rewrite` | codewise-rewrite | tencent |
+| `codewise-jump` | codewise-jump | tencent |
+| `hunyuan-image-alpha` | Hunyuan Image Alpha | tencent |
+| `nes-gf` | nes-gf | tencent |
 
 ### 海外版 WorkBuddy AI（21 个）
 
@@ -236,6 +253,31 @@ model_provider = "codebuddy"
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
 
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
+
+### 同步上游模型列表
+
+`/v1/models` 里的列表是硬编码的。上游发新模型后，可直接拉取云端配置核对：
+
+```bash
+# 国内版
+uv run python -c "
+import sys; sys.path.insert(0, 'server')
+from codebuddy_client_demo import CodeBuddyClient
+c = CodeBuddyClient('https://copilot.tencent.com')
+c.ensure_authenticated(open_browser=False)
+h = {'User-Agent': 'CodeBuddyIDE/4.10.33259736', 'X-Product': 'SaaS',
+     'X-IDE-Type': 'VSCode', 'X-IDE-Name': 'VSCode',
+     'X-IDE-Version': '1.70.2', 'X-Product-Version': '4.10.33259736'}
+cfg = c._unwrap(c._request('GET', '/v3/config?repos=', headers={**h, **c.auth_headers()}))
+for m in cfg.get('models') or []: print(' ', m.get('id'), '|', m.get('name'))
+"
+
+# 海外版
+uv run server/workbuddy_ai_client_demo.py --config
+```
+
+> `User-Agent` 必须是 `CodeBuddyIDE/<version>` 形式，否则上游返回
+> `HTTP 400 / code 12403 check ua, get coding copilot version error`。
 
 ## 命令行参数
 
