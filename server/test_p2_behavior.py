@@ -227,6 +227,8 @@ class _FakeResp:
         self.status_code = status_code
         self._body = body
 
+    headers = httpx.Headers({"content-type": "text/event-stream"})
+
     async def aread(self):
         return self._body
 
@@ -348,7 +350,7 @@ def harness(tmp_path, monkeypatch):
         if h.script:
             cfg = h.script.pop(0)
         else:
-            cfg = {"status": 200, "lines": ["data: [DONE]"]}
+            cfg = {"status": 200, "lines": ['data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}', "data: [DONE]"]}
         h.captured.append({"method": request.method, "url": str(request.url),
                            "headers": request.headers, "content": request.content})
         return _FakeResp(
@@ -500,7 +502,7 @@ class TestCircuitBreakerEndToEnd:
     def test_200_clears_5xx_streak(self, harness):
         harness.script = (
             [{"status": 502, "body": b"bad"} for _ in range(4)]
-            + [{"status": 200, "lines": ["data: [DONE]"]}]
+            + [{"status": 200, "lines": ['data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}', "data: [DONE]"]}]
             + [{"status": 502, "body": b"bad"} for _ in range(4)]
         )
         statuses = []

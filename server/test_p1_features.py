@@ -175,6 +175,7 @@ class _FakeResp:
         self._lines = lines
         self._exc = exc
         self.status_code = status_code
+        self.headers = httpx.Headers({"content-type": "text/event-stream"})
 
     async def aread(self):
         return b""
@@ -249,7 +250,7 @@ def harness(tmp_path, monkeypatch):
         if h.script:
             lines, exc = h.script.pop(0)
         else:
-            lines, exc = ["data: [DONE]"], None
+            lines, exc = ['data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}', "data: [DONE]"], None
         h.captured.append({"method": request.method, "url": str(request.url),
                            "headers": request.headers, "content": request.content})
         return _FakeResp(lines, exc)

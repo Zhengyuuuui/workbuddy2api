@@ -645,6 +645,43 @@ def _extract_upstream_response_id(chunk: dict[str, Any]) -> str | None:
     return None
 
 
+def _looks_like_transient_reject(collected: dict[str, Any]) -> bool:
+    """判断聚合结果是否为「上游瞬时拒绝」：HTTP 200 但上游一帧都没给。
+
+    典型形态（issue 反馈）：上游对超长上下文的 stream:false 请求秒拒，
+    返回 HTTP 200 + 空事件流（chunk_count=0、"0 stream events received"），
+    客户端只能报 "empty or malformed response"。
+
+    判据是 collect_upstream 记录的 `_upstream_frames == 0`（上游确实什么都没吐），
+    而不是"内容为空"——后者是模型合法回答空串的情形（有 data: 帧，只是内容空）。
+    """
+    return int(collected.get("_upstream_frames") or 0) == 0
+
+
+def _pick_retry_model(state: ProxyState, current: str) -> str | None:
+    """挑一个不同于 current 的重试模型（优先最便宜档位，跳过补全/重写类专用模型）。
+
+    只列 chat 可用的模型 id（补全 codewise-* / nes-gf、图像 hunyuan-image-alpha
+    是专用通道，不能用于对话），不依赖 /v1/models 的内联清单，避免两处漂移。
+    """
+    current = (current or "").lower()
+    overseas = (
+        "workbuddy" in (state.client.endpoint or "").lower()
+        or state.client.platform.lower() == "workbuddy-ai"
+    )
+    candidates = (
+        # 国际版（与 /v1/models 实测清单同源）
+        ["default-model", "fast-model", "deepseek-v4.1-flash", "hy3", "glm-5.3"]
+        if overseas else
+        # 国内版：auto/default 交上游自选，其后是最便宜的快模型
+        ["auto", "default", "hy3", "hy3-x", "hunyuan-chat", "deepseek-v4.1-flash"]
+    )
+    for mid in candidates:
+        if mid.lower() != current:
+            return mid
+    return None
+
+
 def resolve_device_token(cli_value: str | None = None) -> tuple[str | None, str]:
     """解析 x-device-token：CLI 参数 > 环境变量 CODEBUDDY_DEVICE_TOKEN > 自动发现。
 
@@ -1261,9 +1298,25 @@ async def forward_chat(
             headers={"Cache-Control": "no-cache", "Connection": "close"}
         )
     else:
-        # 非流式：聚合后返回
-        collected = await collect_upstream(url, headers, upstream_body, protocol)
-        return JSONResponse(content=convert_nonstream(collected, protocol, original))
+        # 非流式：聚合后返回。上游瞬时拒绝（HTTP 200 但一帧都没给）时换模型重试一次，
+        # 复用同一份会话/trace 身份——换号重试若换会话 ID，上游看到的是
+        # 多个并发会话而非一次对话的一次重试（外部项目逆向结论）。
+        for attempt in range(2):
+            collected = await collect_upstream(url, headers, upstream_body, protocol)
+            frames = int(collected.pop("_upstream_frames", 0) or 0)
+            alt = None if attempt else _pick_retry_model(state, upstream_body.get("model", ""))
+            if frames > 0 or not alt:
+                # 内部字段不外泄
+                collected.pop("_upstream_frames", None)
+                return JSONResponse(content=convert_nonstream(collected, protocol, original))
+            diagnostic("upstream_transient_reject_retry",
+                       protocol=protocol, from_model=upstream_body.get("model", ""), to_model=alt)
+            upstream_body["model"] = alt
+            # x-model-id 仅国内版存在，随模型同步
+            if "x-model-id" in headers:
+                headers["x-model-id"] = alt
+            # 上游拒收时不要留上一轮的 previous_response_id（否则换模型也会被拒）
+            upstream_body.pop("previous_response_id", None)
 
 
 # ============================================================================
@@ -1630,6 +1683,7 @@ async def collect_upstream(
     content = ""
     upstream_response_id: str | None = None
     tool_calls_dict: dict[int, dict] = {}  # 使用 dict 按 index 累加
+    frame_count = 0  # 实际收到的 data: 帧数（0 = 上游一帧都没给）
     # DSML 缓冲区
     dsml_buffer = DSMLStreamBuffer()
     
@@ -1669,6 +1723,66 @@ async def collect_upstream(
                 
                 state.breaker.note_success(state.client.endpoint, body.get("model", ""))
                 
+                # 非 SSE 兜底：上游对 stream:false 可能直接回普通 JSON（content-type 非
+                # text/event-stream）。此时逐行等 data: 永远等不到，会以 chunk_count=0
+                # 的空响应收尾，客户端报 "HTTP 200 but empty/malformed response"。
+                # 故先按 content-type 判定，JSON 响应直接整体读入解析。
+                ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                if ctype and ctype != "text/event-stream":
+                    raw = await resp.aread()
+                    try:
+                        parsed = json.loads(raw)
+                    except json.JSONDecodeError:
+                        raise HTTPException(
+                            status_code=502,
+                            detail={"error": {
+                                "message": f"upstream returned {ctype} for a non-streaming request "
+                                           f"(unparseable): {raw[:200]!r}",
+                                "type": "upstream_error",
+                            }},
+                        )
+                    diagnostic("upstream_nonstream_body", protocol=protocol, content_type=ctype)
+                    content = ((parsed.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+                    tool_calls_raw = ((parsed.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
+                    tool_calls = [
+                        {
+                            "id": tc.get("id", ""),
+                            "type": tc.get("type", "function"),
+                            "function": {
+                                "name": (tc.get("function") or {}).get("name", ""),
+                                "arguments": (tc.get("function") or {}).get("arguments", ""),
+                            },
+                        }
+                        for tc in (tool_calls_raw or [])
+                        if (tc.get("function") or {}).get("name")
+                    ]
+                    finish_reason = ((parsed.get("choices") or [{}])[0]).get("finish_reason") or "stop"
+                    usage = parsed.get("usage") or usage
+                    upstream_response_id = _extract_upstream_response_id(parsed)
+                    if upstream_response_id and conv_id:
+                        state.record_response_id(conv_id, upstream_response_id)
+                    if usage:
+                        state.record_burn(body.get("model", ""), usage)
+                    log_upstream_response(protocol, content, stream=False)
+                    return {
+                        "id": parsed.get("id") or "chatcmpl-" + uuid.uuid4().hex,
+                        "object": "chat.completion",
+                        "created": now_s(),
+                        "model": body.get("model", "auto"),
+                        # 上游确实答复了（哪怕不是 SSE），记 1 帧，避免被当作瞬时拒绝
+                        "_upstream_frames": 1,
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": content,
+                                "tool_calls": tool_calls if tool_calls else None,
+                            },
+                            "finish_reason": finish_reason,
+                        }],
+                        "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                    }
+
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line.startswith("data:"):
@@ -1683,6 +1797,7 @@ async def collect_upstream(
                     except json.JSONDecodeError:
                         continue
                     
+                    frame_count += 1
                     rid = _extract_upstream_response_id(chunk)
                     if rid:
                         upstream_response_id = rid
@@ -1772,6 +1887,9 @@ async def collect_upstream(
         "object": "chat.completion",
         "created": now_s(),
         "model": body.get("model", "auto"),
+        # 内部字段：本次上游流实际收到的 data: 帧数（仅本地判定用，对外会被
+        # convert_nonstream / OpenAI 客户端忽略）。0 = 上游一帧都没给。
+        "_upstream_frames": frame_count,
         "choices": [{
             "index": 0,
             "message": {

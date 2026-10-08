@@ -470,6 +470,22 @@ uv run codebuddy_proxy.py --port 8789
 
 proxy 已自动处理（会自动补 system 首条消息），如仍有问题请更新到最新代码。
 
+### 非流式请求报 "empty or malformed response (HTTP 200)"
+
+Claude Code 等客户端在**已有项目**（超长上下文）里偶发：
+
+```
+API returned an empty or malformed response (HTTP 200) — body is an event stream
+(the non-streaming request was answered with a stream), 0 stream events received
+```
+
+上游对超长上下文的非流式请求会秒拒，返回 HTTP 200 但**一帧都不给**；新开对话上下文小则正常。proxy 已做两层兜底（两端通用）：
+
+- **非 SSE 兜底**：上游若回的是普通 JSON（`content-type` 非 `text/event-stream`），整体读入解析成标准响应，而不是逐行等 `data:` 最后交出空响应
+- **瞬时拒绝重试**：HTTP 200 但零帧时换模型重试一次；重试**复用同一份会话 / trace 身份**（换模型不换会话，避免上游判成多个并发会话），并清掉上一轮的 `previous_response_id`
+
+回归测试：`server/test_nonstream_hardening.py`。
+
 ## 技术细节
 
 - **架构**: FastAPI + httpx（异步）

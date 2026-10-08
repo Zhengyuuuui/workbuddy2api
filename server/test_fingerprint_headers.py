@@ -190,6 +190,7 @@ class TestConversationId:
 
 class _FakeResp:
     status_code = 200
+    headers = httpx.Headers({"content-type": "text/event-stream"})
 
     async def aread(self):
         return b""
