@@ -337,9 +337,16 @@ def get_state() -> ProxyState:
 # ============================================================================
 
 OFFICIAL_IDE_VERSION = "4.12.0"
-# 国际版官方客户端指纹（2026-09-25 mitm 抓包实测，见 doc/HANDOFF-intl-token.md）
-INTL_IDE_VERSION = "5.5.2"
-INTL_CLIENT_UA = f"WorkBuddy/{INTL_IDE_VERSION} WorkBuddy/{INTL_IDE_VERSION} CLI/2.137.1"
+# 国际版官方客户端指纹。
+# 2026-10-09 实测（本机 WorkBuddyAI.exe 5.7.6 抓包，见 wb/capture/chat2_dump.jsonl）：
+#   官方真实 UA = `workbuddy-ai/5.7.6 workbuddy-ai/5.7.6 CLI/2.156.0`（全小写，
+#   与旧版 `WorkBuddy/5.5.2 ... CLI/2.137.1` 大小写与版本号都不同）。
+# 旧值 5.5.2/2.137.1 来自 2026-09-25 抓包（doc/HANDOFF-intl-token.md），已过期。
+INTL_IDE_VERSION = "5.7.6"
+INTL_CLI_VERSION = "2.156.0"
+INTL_CLIENT_UA = (
+    f"workbuddy-ai/{INTL_IDE_VERSION} workbuddy-ai/{INTL_IDE_VERSION} CLI/{INTL_CLI_VERSION}"
+)
 
 
 def _hex32() -> str:
@@ -857,7 +864,11 @@ async def list_models():
     )
     
     if overseas:
-        # 海外 WorkBuddy AI 模型（实测可用，共 21 个）
+        # 海外 WorkBuddy AI 模型——与上游 /v3/config 实时返回对齐
+        # （2026-10-09 uv run server/workbuddy_ai_client_demo.py --config 抓取，共 30 个）。
+        # 上游已下线 gpt-5.3-codex / kimi-k2.5 / minimax-m3，新增 gpt-6.* / gemini-3.8-flash /
+        # glm-5.3-flash / grok-4.7 / seedance-2.5 / deepseek-v4.1-flash-sg / hy4-preview-f /
+        # kimi-k2.8-preview / gpt-image-2.5-sunburst。
         models = [
             {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
             {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
@@ -865,21 +876,30 @@ async def list_models():
             {"id": "primary-model", "name": "Primary", "vendor": "codebuddy"},
             {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy4-preview-f", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
             {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "vendor": "openai"},
             {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "vendor": "openai"},
             {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "vendor": "openai"},
             {"id": "gpt-5.5", "name": "GPT-5.5", "vendor": "openai"},
             {"id": "gpt-5.4", "name": "GPT-5.4", "vendor": "openai"},
-            {"id": "gpt-5.3-codex", "name": "GPT-5.3-Codex", "vendor": "openai"},
+            {"id": "gpt-6-astra", "name": "GPT-6-Astra", "vendor": "openai"},
+            {"id": "gpt-6-sol", "name": "GPT-6-Sol", "vendor": "openai"},
+            {"id": "gpt-6-luna", "name": "GPT-6-Luna", "vendor": "openai"},
+            {"id": "gpt-6.1-sol", "name": "GPT-6.1-Sol", "vendor": "openai"},
+            {"id": "gpt-image-2.5-sunburst", "name": "GPT-Image-2.5-Sunburst", "vendor": "openai"},
             {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "vendor": "google"},
+            {"id": "gemini-3.8-flash", "name": "Gemini-3.8-Flash", "vendor": "google"},
             {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
+            {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash", "vendor": "zhipu"},
             {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
             {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
+            {"id": "kimi-k2.8-preview", "name": "Kimi-K2.8-Preview", "vendor": "moonshot"},
             {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
-            {"id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "moonshot"},
-            {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
             {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
+            {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
+            {"id": "grok-4.7", "name": "Grok-4.7", "vendor": "xai"},
+            {"id": "seedance-2.5", "name": "Seedance-2.5", "vendor": "bytedance"},
         ]
     else:
         # 国内 CodeBuddy 模型（产品配置 + 实测补充，共 27 个）
@@ -1143,7 +1163,10 @@ async def forward_chat(
     state = get_state()
     state.ensure_auth()
     
-    stream = bool(body.get("stream"))
+    # 用原始请求的 stream 意图（协议适配器可能改写 stream 字段，
+    # 但客户端的真实意图永远以 original 为准；openai 协议 original 为 None，退回 body）
+    source = original if original is not None else body
+    stream = bool(source.get("stream"))
     upstream_body = dict(body)
     conv_id = state.get_conversation_id(upstream_body)
     
@@ -1353,7 +1376,7 @@ async def stream_upstream(
     
     # Responses 协议转换器
     responses_state = ResponsesStreamConverter(
-        model=upstream_body.get("model", "auto")
+        model=body.get("model", "auto")
     ) if protocol == "responses" and ResponsesStreamConverter else None
     
     # DSML 缓冲区（用于处理可能的文本标记格式工具调用）
@@ -1567,43 +1590,9 @@ async def stream_upstream(
                             yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 
                 # 发送结束事件
-                if protocol == "responses" and response_text_started:
-                    for event_name, payload in [
-                        ("response.output_text.done", {
-                            "type": "response.output_text.done",
-                            "item_id": response_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "text": response_text
-                        }),
-                        ("response.content_part.done", {
-                            "type": "response.content_part.done",
-                            "item_id": response_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": response_text, "annotations": []}
-                        }),
-                        ("response.output_item.done", {
-                            "type": "response.output_item.done",
-                            "output_index": 0,
-                            "item": {
-                                "id": response_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": response_text, "annotations": []}]
-                            }
-                        }),
-                        ("response.completed", {
-                            "type": "response.completed",
-                            "response": {
-                                "id": response_id,
-                                "object": "response",
-                                "status": "completed",
-                                "output_text": response_text
-                            }
-                        }),
-                    ]:
-                        yield f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+                if protocol == "responses" and responses_state:
+                    for event_name, event_data in responses_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 
                 elif protocol == "anthropic" and anthropic_state:
                     for event_name, event_data in anthropic_state.finish():
@@ -1627,19 +1616,87 @@ async def stream_upstream(
             }
         }
         yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
-    
+
+    except httpx.TransportError as exc:
+        # 上游传输层中断：连接被重置 / SSE 流意外关闭 / 分块解码失败等。
+        # 通常是瞬时网络抖动。两种情形：
+        #   1) done_seen=True：尾部 [DONE] 之后连接才关，主体已完整，补发协议级
+        #      结束事件静默收尾（否则 Responses 流会被 422 打断）。
+        #   2) 中途断裂（incomplete chunked read）：上游在内容发完前就掐断。
+        #      若已收到部分内容，最佳努力把已累积的内容作为完整响应补发结束事件
+        #      （Responses 返回截断文本但流程正常完成，避免 422）；只有当一帧都没
+        #      收到（无可用内容）时才回退到结构化 upstream_error。
+        diagnostic("stream_transport_error", protocol=protocol, chunks=chunk_count,
+            exc_type=type(exc).__name__, error=str(exc), done_seen=done_seen,
+            elapsed=round(time.time() - stream_start_time, 2))
+        state.write_log("stream_transport_error", protocol=protocol, chunks=chunk_count,
+            exc_type=type(exc).__name__, error=str(exc), done_seen=done_seen)
+        if protocol == "responses" and responses_state:
+            # 已在处理中（收到过文本或已 started）：把已累积内容作为完整响应收尾。
+            # 中途断裂时文本是截断的，但比直接 422 更可用，且客户端不会中断。
+            if done_seen or getattr(responses_state, "started", False) or responses_state.text:
+                try:
+                    for event_name, event_data in responses_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                except Exception as fin_exc:
+                    diagnostic("finish_reemit_error", protocol=protocol, error=str(fin_exc))
+                return
+        elif protocol == "anthropic" and anthropic_state:
+            if done_seen or getattr(anthropic_state, "text", ""):
+                try:
+                    for event_name, event_data in anthropic_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                except Exception as fin_exc:
+                    diagnostic("finish_reemit_error", protocol=protocol, error=str(fin_exc))
+                return
+        # 无可用内容：回退到结构化错误。
+        # 必须按协议正确定帧：Responses/Anthropic 用 `event: error` 帧，否则客户端
+        # 收到裸 `data:` 会触发 422 格式转换错误（本次报错的根因）。openai 用裸 data。
+        message = f"upstream stream interrupted: {type(exc).__name__}: {exc}"
+        if protocol == "responses":
+            err_event = {
+                "type": "error",
+                "error": {"type": "server_error", "message": message},
+            }
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        elif protocol == "anthropic":
+            err_event = {
+                "type": "error",
+                "error": {"type": "api_error", "message": message},
+            }
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        else:
+            error_chunk = {
+                "error": {
+                    "message": message,
+                    "type": "upstream_error",
+                }
+            }
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
+
     except Exception as exc:
-        # 【日志】其他错误
+        # 【日志】其他错误：保留异常类型与堆栈，便于定位（此前只记 str(exc)，
+        # 当异常 __str__ 为空时无从判断根因）。
+        import traceback as _tb
+        tb_text = _tb.format_exc()
         diagnostic("stream_error", protocol=protocol, chunks=chunk_count,
-            elapsed=round(time.time() - stream_start_time, 2), error=str(exc))
-        state.write_log("stream_error", protocol=protocol, chunks=chunk_count, error=str(exc))
+            exc_type=type(exc).__name__, error=str(exc),
+            elapsed=round(time.time() - stream_start_time, 2))
+        state.write_log("stream_error", protocol=protocol, chunks=chunk_count,
+            exc_type=type(exc).__name__, error=str(exc), traceback=tb_text)
         error_chunk = {
             "error": {
-                "message": f"stream error: {exc}",
+                "message": f"stream error: {type(exc).__name__}: {exc}",
                 "type": "internal_error"
             }
         }
-        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
+        if protocol == "responses":
+            yield f"event: error\ndata: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
+        elif protocol == "anthropic":
+            err_event = {"type": "error", "error": {"type": "api_error", "message": error_chunk["error"]["message"]}}
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        else:
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
     
     finally:
         # previous_response_id 会话延续：仅流正常结束（upstream_done）时记录

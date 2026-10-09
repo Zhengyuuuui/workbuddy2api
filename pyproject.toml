@@ -16,12 +16,15 @@ dev = [
     "pytest>=7.4.0",
 ]
 
-[project.scripts]
-codebuddy-proxy = "codebuddy_proxy:main"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# 本项目是脚本集合（入口在 server/ 下），不是可打包安装的库；
+# server/ 也不是 codebuddy_proxy 包目录，hatchling 默认文件选择会失败。
+# 标记为非打包项目，uv run 直接以脚本方式运行，不再尝试 editable 构建。
+[tool.uv]
+package = false
 
 [dependency-groups]
 dev = [
