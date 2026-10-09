@@ -42,6 +42,15 @@ SMH_HOST_OVERSEAS = "https://smh38ewydmp37j7v.ap-singapore.api.tencentsmh.com"
 MODEL_API_HOST = "https://api.lkeap.cloud.tencent.com"
 AUTH_PLATFORM = "workbuddy-ai"  # product.json authentication.attributes.platform
 
+# 官方 WorkBuddy AI 客户端指纹 UA（2026-10-09 本机 WorkBuddyAI.exe 5.7.6 抓包，
+# 见 wb/capture/chat2_dump.jsonl）。服务端 /v3/config 会校验 UA 中的 coding
+# copilot 版本号（"check ua, get coding copilot version error"），必须带真实版本。
+INTL_IDE_VERSION = "5.7.6"
+INTL_CLI_VERSION = "2.156.0"
+WORKBUDDY_AI_UA = (
+    f"workbuddy-ai/{INTL_IDE_VERSION} workbuddy-ai/{INTL_IDE_VERSION} CLI/{INTL_CLI_VERSION}"
+)
+
 
 class WorkBuddyAIError(RuntimeError):
     pass
@@ -102,7 +111,7 @@ class WorkBuddyAIClient:
         body: Any = None,
         timeout: float = 30,
     ) -> Any:
-        request_headers = {"User-Agent": "WorkBuddyAIClientDemo/1.0"}
+        request_headers = {"User-Agent": WORKBUDDY_AI_UA}
         request_headers.update(headers or {})
         data = None
         if body is not None:
