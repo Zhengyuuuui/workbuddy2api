@@ -175,6 +175,8 @@ class ProxyState:
         self._usage_events: deque[tuple[float, float]] = deque()
         self._credits_total_remain: float | None = None  # 最近一次成功获取的剩余额度
         self._credits_cache: dict[str, Any] | None = None  # {"fetched_at": float, "payload": dict}
+        # 云端模型列表缓存（/v3/config）：{"fetched_at": float, "models": list[dict]}
+        self._cloud_models_cache: dict[str, Any] | None = None
         self._burn_warned = False
         # 客户端会话键（body 轻量指纹）→ conversation_id，模拟 IDE 会话链路
         self._conversations: dict[str, str] = {}
@@ -845,12 +847,96 @@ async def health():
     }
 
 
+def _guess_vendor(model_id: str) -> str:
+    """按 id 前缀猜测厂商（上游 /v3/config 的 vendor 是 e/f/j/i 等档位码，
+    不是厂商名，无法直接用于 owned_by，故沿用本文件的命名风格推断）。"""
+    mid = (model_id or "").lower()
+    if mid.startswith(("gpt-", "chatgpt")):
+        return "openai"
+    if mid.startswith("gemini"):
+        return "google"
+    if mid.startswith("glm"):
+        return "zhipu"
+    if mid.startswith("kimi"):
+        return "moonshot"
+    if mid.startswith(("deepseek", "deepseek-")):
+        return "deepseek"
+    if mid.startswith(("hy", "hunyuan", "space-bunny", "nes-")):
+        return "tencent"
+    if mid.startswith("grok"):
+        return "xai"
+    if mid.startswith("minimax"):
+        return "minimax"
+    if mid.startswith("seedance"):
+        return "bytedance"
+    if mid.startswith("step-"):
+        return "stepfun"
+    return "codebuddy"
+
+
+async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
+    """从上游 /v3/config 拉取云端模型列表；失败返回 None（调用方回退到硬编码列表）。
+
+    海外端点必须带官方 UA，否则服务端以 400
+    "check ua, get coding copilot version error" 拒绝（2026-10-09 实测）。
+    """
+    url = state.client.endpoint.rstrip("/") + "/v3/config"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=30.0), trust_env=False) as client:
+            resp = await client.get(
+                url,
+                params={"repos": ""},
+                headers={
+                    **state.client.auth_headers(),
+                    "User-Agent": INTL_CLIENT_UA,
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        diagnostic("cloud_models_fetch_error", error=str(exc)[:200])
+        return None
+    if resp.status_code != 200:
+        diagnostic("cloud_models_fetch_error", http_status=resp.status_code,
+                   detail=resp.text[:300])
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        diagnostic("cloud_models_fetch_error", detail="non-JSON response")
+        return None
+    # /v3/config 统一包 {"code":0,"data":{...,"models":[...]}}
+    node = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(node, dict) and isinstance(node.get("data"), dict):
+        node = node["data"]
+    models = (node or {}).get("models") if isinstance(node, dict) else None
+    if not isinstance(models, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if not mid:
+            continue
+        out.append({
+            "id": mid,
+            "name": m.get("name") or mid,
+            "vendor": _guess_vendor(str(mid)),
+        })
+    return out or None
+
+
 # ============================================================================
 # 端点：/v1/models
 # ============================================================================
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(refresh: int = 0):
+    """模型列表。
+
+    海外端点优先用上游 /v3/config 的实时列表（缓存 10 分钟，?refresh=1 强制刷新），
+    上游不可用/未登录时回退到内置快照，避免硬编码列表过期后与新上游不一致。
+    """
     state = get_state()
     log_client_request("GET", "/v1/models", None)
     state.ensure_auth()
@@ -864,11 +950,8 @@ async def list_models():
     )
     
     if overseas:
-        # 海外 WorkBuddy AI 模型——与上游 /v3/config 实时返回对齐
-        # （2026-10-09 uv run server/workbuddy_ai_client_demo.py --config 抓取，共 30 个）。
-        # 上游已下线 gpt-5.3-codex / kimi-k2.5 / minimax-m3，新增 gpt-6.* / gemini-3.8-flash /
-        # glm-5.3-flash / grok-4.7 / seedance-2.5 / deepseek-v4.1-flash-sg / hy4-preview-f /
-        # kimi-k2.8-preview / gpt-image-2.5-sunburst。
+        # 海外 WorkBuddy AI 模型快照（2026-10-13 与上游 /v3/config 对齐，28 个）。
+        # 仅作为上游 /v3/config 不可用时的回退：实时列表优先，见上方 _fetch_cloud_models。
         models = [
             {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
             {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
@@ -878,15 +961,12 @@ async def list_models():
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy4-preview-f", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
-            {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "vendor": "openai"},
             {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "vendor": "openai"},
             {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "vendor": "openai"},
             {"id": "gpt-5.5", "name": "GPT-5.5", "vendor": "openai"},
             {"id": "gpt-5.4", "name": "GPT-5.4", "vendor": "openai"},
-            {"id": "gpt-6-astra", "name": "GPT-6-Astra", "vendor": "openai"},
             {"id": "gpt-6-sol", "name": "GPT-6-Sol", "vendor": "openai"},
             {"id": "gpt-6-luna", "name": "GPT-6-Luna", "vendor": "openai"},
-            {"id": "gpt-6.1-sol", "name": "GPT-6.1-Sol", "vendor": "openai"},
             {"id": "gpt-image-2.5-sunburst", "name": "GPT-Image-2.5-Sunburst", "vendor": "openai"},
             {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "vendor": "google"},
             {"id": "gemini-3.8-flash", "name": "Gemini-3.8-Flash", "vendor": "google"},
@@ -900,7 +980,23 @@ async def list_models():
             {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
             {"id": "grok-4.7", "name": "Grok-4.7", "vendor": "xai"},
             {"id": "seedance-2.5", "name": "Seedance-2.5", "vendor": "bytedance"},
+            {"id": "step-5-preview", "name": "Step-5-Preview", "vendor": "stepfun"},
         ]
+        # 实时优先：拉取上游 /v3/config（缓存 10 分钟），失败静默回退到快照
+        now = time.time()
+        cached = state._cloud_models_cache
+        live: list[dict[str, Any]] | None = None
+        if not refresh and cached and (now - cached["fetched_at"]) < 600:
+            live = cached["models"]
+        else:
+            live = await _fetch_cloud_models(state)
+            if live:
+                state._cloud_models_cache = {"fetched_at": now, "models": live}
+            elif cached:
+                # 刷新失败时继续用旧缓存，避免瞬时抖动把列表打空
+                live = cached["models"]
+        if live:
+            models = live
     else:
         # 国内 CodeBuddy 模型（产品配置 + 实测补充，共 27 个）
         models = [
@@ -1385,6 +1481,8 @@ async def stream_upstream(
     emitted_response_created = False
     response_text = ""
     response_text_started = False
+    # 协议结束事件（response.completed / message_stop）是否已下发，防止重复收尾
+    finish_emitted = False
     chunk_count = 0
     done_seen = False
     upstream_response_id: str | None = None
@@ -1589,15 +1687,22 @@ async def stream_upstream(
                         for event_name, event_data in events:
                             yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 
-                # 发送结束事件
+                # 发送结束事件。finish_emitted 保证整个流只结束一次：
+                # 正常路径结束后若 aclose()/尾部读取再抛 TransportError，
+                # 下面的恢复分支不会重复补发 completed（ResponsesStreamConverter
+                # .finish() 自身不是幂等的）。
                 if protocol == "responses" and responses_state:
-                    for event_name, event_data in responses_state.finish():
-                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
-                
+                    if not finish_emitted:
+                        finish_emitted = True
+                        for event_name, event_data in responses_state.finish():
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 elif protocol == "anthropic" and anthropic_state:
-                    for event_name, event_data in anthropic_state.finish():
-                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
-                
+                    if not finish_emitted:
+                        finish_emitted = True
+                        for event_name, event_data in anthropic_state.finish():
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 elif protocol == "openai":
                     yield b"data: [DONE]\n\n"
 
@@ -1631,18 +1736,20 @@ async def stream_upstream(
             elapsed=round(time.time() - stream_start_time, 2))
         state.write_log("stream_transport_error", protocol=protocol, chunks=chunk_count,
             exc_type=type(exc).__name__, error=str(exc), done_seen=done_seen)
-        if protocol == "responses" and responses_state:
+        if protocol == "responses" and responses_state and not finish_emitted:
             # 已在处理中（收到过文本或已 started）：把已累积内容作为完整响应收尾。
             # 中途断裂时文本是截断的，但比直接 422 更可用，且客户端不会中断。
             if done_seen or getattr(responses_state, "started", False) or responses_state.text:
+                finish_emitted = True
                 try:
                     for event_name, event_data in responses_state.finish():
                         yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 except Exception as fin_exc:
                     diagnostic("finish_reemit_error", protocol=protocol, error=str(fin_exc))
                 return
-        elif protocol == "anthropic" and anthropic_state:
+        elif protocol == "anthropic" and anthropic_state and not finish_emitted:
             if done_seen or getattr(anthropic_state, "text", ""):
+                finish_emitted = True
                 try:
                     for event_name, event_data in anthropic_state.finish():
                         yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
