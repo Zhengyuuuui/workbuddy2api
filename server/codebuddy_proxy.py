@@ -874,6 +874,38 @@ def _guess_vendor(model_id: str) -> str:
     return "codebuddy"
 
 
+def _parse_credit_rate(raw: Any) -> float | None:
+    """解析上游 credits 字段里的倍率。
+
+    实测上游取值有四种形态（2026-10-15 /v3/config）：
+      'x0.34 credits' / 'x0.77' / ''（未定价）/ None
+    只取首个 x 之后的数字；解析不出或非数字返回 None。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    m = re.search(r"x\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _decorate_model_name(name: str, rate: float | None) -> str:
+    """把倍率附到展示名后面，便于客户端挑便宜模型：'Fast' -> 'Fast (x0.34)'。
+
+    固定两位小数：上游 credits 一律两位（x0.00 / x0.34 / x3.31），
+    用 :g 会把 x0.00 显示成 x0、x1.90 显示成 x1.9，与上游不一致。
+    """
+    if rate is None:
+        return name
+    return f"{name} (x{rate:.2f})"
+
+
 async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
     """从上游 /v3/config 拉取云端模型列表；失败返回 None（调用方回退到硬编码列表）。
 
@@ -918,10 +950,14 @@ async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
         mid = m.get("id")
         if not mid:
             continue
+        name = m.get("name") or str(mid)
+        rate = _parse_credit_rate(m.get("credits"))
         out.append({
             "id": mid,
-            "name": m.get("name") or mid,
+            "name": _decorate_model_name(name, rate),
             "vendor": _guess_vendor(str(mid)),
+            # 原始倍率单独给一份，方便客户端自行排序/过滤，不依赖名字解析
+            "credit_rate": rate,
         })
     return out or None
 
@@ -1037,6 +1073,8 @@ async def list_models(refresh: int = 0):
             "created": 0,
             "owned_by": m.get("vendor", "codebuddy"),
             "name": m.get("name", m["id"]),
+            # 上游 credits 倍率（海外 /v3/config 实时列表才有；国内/快照为 None）
+            "credit_rate": m.get("credit_rate"),
         }
         for m in models
     ]
