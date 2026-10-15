@@ -906,6 +906,37 @@ def _decorate_model_name(name: str, rate: float | None) -> str:
     return f"{name} (x{rate:.2f})"
 
 
+# /v1/models 的 id 上附加的倍率后缀，形如 " (x0.34)"。用于让只展示 id 的客户端
+# （如 cc-switch）也能看到消耗倍率。转发到上游前必须剥掉——上游不认识这个后缀。
+_CREDIT_SUFFIX_RE = re.compile(r"\s*\(\s*x\s*[0-9]+(?:\.[0-9]+)?\s*\)\s*$", re.IGNORECASE)
+# 上下文长度标记（cc-switch/Claude Code 会写 hy4-preview-f[1M]），上游同样不认
+_CONTEXT_TAG_RE = re.compile(r"\s*\[\s*\d+\s*[kKmM]\s*\]\s*$")
+
+
+def _decorate_model_id(model_id: str, rate: float | None) -> str:
+    """给 /v1/models 里返回的 id 附上倍率：'fast-model' -> 'fast-model (x0.34)'。
+
+    只改对外展示的 id；转发时由 _normalize_model_id() 剥回真 id。
+    """
+    if rate is None or not model_id:
+        return model_id
+    return f"{model_id} (x{rate:.2f})"
+
+
+def _normalize_model_id(model: Any) -> Any:
+    """把客户端回传的展示用模型名还原成上游真 id。
+
+    客户端（cc-switch / Claude Code 等）会把 /v1/models 里的 id 原样回传，
+    因此可能带上我们附加的倍率后缀 " (x0.34)"，也可能带上下文标记 "[1M]"。
+    两者上游都不认识，需在转发前剥掉；非字符串或没有后缀时原样返回。
+    """
+    if not isinstance(model, str) or not model:
+        return model
+    cleaned = _CREDIT_SUFFIX_RE.sub("", model)
+    cleaned = _CONTEXT_TAG_RE.sub("", cleaned).strip()
+    return cleaned or model
+
+
 async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
     """从上游 /v3/config 拉取云端模型列表；失败返回 None（调用方回退到硬编码列表）。
 
@@ -953,7 +984,9 @@ async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
         name = m.get("name") or str(mid)
         rate = _parse_credit_rate(m.get("credits"))
         out.append({
-            "id": mid,
+            # id 也带上倍率，让只看 id 的客户端（cc-switch）可见；
+            # 转发时 _normalize_model_id() 会剥掉，不影响上游
+            "id": _decorate_model_id(str(mid), rate),
             "name": _decorate_model_name(name, rate),
             "vendor": _guess_vendor(str(mid)),
             # 原始倍率单独给一份，方便客户端自行排序/过滤，不依赖名字解析
@@ -1078,7 +1111,7 @@ async def list_models(refresh: int = 0):
         }
         for m in models
     ]
-    
+
     return {"object": "list", "data": data}
 
 
@@ -1302,12 +1335,23 @@ async def forward_chat(
     source = original if original is not None else body
     stream = bool(source.get("stream"))
     upstream_body = dict(body)
+    # 客户端可能把 /v1/models 里带倍率后缀的 id 原样回传（"fast-model (x0.34)"），
+    # 也可能带 [1M] 上下文标记；转发前统一还原成上游真 id。
+    if "model" in upstream_body:
+        raw_model = upstream_body.get("model")
+        normalized = _normalize_model_id(raw_model)
+        if normalized != raw_model:
+            diagnostic("model_id_normalized", protocol=protocol,
+                       from_model=raw_model, to_model=normalized)
+            upstream_body["model"] = normalized
     conv_id = state.get_conversation_id(upstream_body)
     
     diagnostic("upstream_request", protocol=protocol, conv_id=conv_id, **body_summary(body))
     
     # P2 熔断：冷却期内快速失败，不打上游（429 与 5xx 熔断统一拒绝格式）
-    model = body.get("model", "")
+    # 用规范化后的 id：同一模型的 "fast-model" 与 "fast-model (x0.34)" 必须
+    # 共用同一熔断器条目，否则换倍率后缀就绕过了熔断。
+    model = upstream_body.get("model", "") or ""
     tripped, remaining = state.breaker.check(state.client.endpoint, model)
     if tripped:
         seconds = max(1, math.ceil(remaining))
