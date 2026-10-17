@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 import codebuddy_proxy
 from codebuddy_client_demo import CodeBuddyClient
 from codebuddy_proxy import ProxyState
+from responses_adapter import ResponsesStreamConverter
 
 GOOD = 'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}'
 
@@ -160,3 +161,82 @@ def test_responses_stream_false_is_json(client):
     assert payload["status"] == "completed"
     # 归一化发生在转发前，上游收到的必须是真 id
     assert captured["body"]["model"] == "fast-model"
+
+
+# --- 6) 回归锁定：Responses 事件必须满足官方 schema ------------------------
+
+def _all_events() -> list[tuple[str, dict]]:
+    """文本 + 工具调用两类路径的事件全集。"""
+    conv = ResponsesStreamConverter("deepseek-v4.1-flash")
+    evs = conv.feed_chunk({
+        "choices": [{"delta": {"content": "hi"}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    })
+    evs += conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "fc1",
+         "function": {"name": "shell", "arguments": "{}"}}]}}]})
+    evs += conv.finish()
+    return evs
+
+
+def test_every_event_has_sequence_number():
+    """Codex 的 Rust 解析器要求每个事件都带 sequence_number；Claude Code
+    容错缺失，所以该缺陷只在 Codex 路径暴露（stream closed before completed）。"""
+    for name, payload in _all_events():
+        assert "sequence_number" in payload, f"{name} 缺 sequence_number"
+
+
+def test_sequence_numbers_are_contiguous_from_zero():
+    seqs = [p["sequence_number"] for _, p in _all_events()]
+    assert seqs == list(range(len(seqs))), f"sequence_number 不连续: {seqs}"
+
+
+def test_response_object_is_responses_api_not_realtime():
+    """object 必须是 "response"。早期版本误用 Realtime API 的
+    "realtime.response"，在 Responses API 里是非法枚举值。"""
+    for name, payload in _all_events():
+        resp = payload.get("response")
+        if resp is not None:
+            assert resp["object"] == "response", f"{name}: object={resp['object']!r}"
+
+
+def test_completed_carries_model_and_output():
+    conv = ResponsesStreamConverter("deepseek-v4.1-flash")
+    conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+    events = dict(conv.finish())
+    resp = events["response.completed"]["response"]
+    assert resp["model"] == "deepseek-v4.1-flash"
+    assert resp["status"] == "completed"
+    assert resp["output"], "completed.response.output 不应为空"
+    # usage.input_tokens_details 必须有 cache_write_tokens（官方必填）
+    details = resp["usage"]["input_tokens_details"]
+    assert "cache_write_tokens" in details
+
+
+def test_content_part_type_is_output_text():
+    """part.type 官方取值为 output_text，不是 text。"""
+    conv = ResponsesStreamConverter("m")
+    evs = conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+    added = dict(evs)["response.content_part.added"]
+    assert added["part"]["type"] == "output_text"
+    # content_part.* 需要 item_id / output_index / content_index
+    for field in ("item_id", "output_index", "content_index"):
+        assert field in added, f"content_part.added 缺 {field}"
+
+
+def test_output_item_added_has_output_index_and_status():
+    conv = ResponsesStreamConverter("m")
+    evs = conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+    added = dict(evs)["response.output_item.added"]
+    assert added["output_index"] == 0
+    assert added["item"]["status"] == "in_progress"
+
+
+def test_function_call_output_index_follows_index():
+    """多工具调用时 output_index 必须跟随 call.index，不能硬编码 0。"""
+    conv = ResponsesStreamConverter("m")
+    evs = conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+        {"index": 2, "id": "fc2", "function": {"name": "b", "arguments": "{}"}}]}}]})
+    delta = dict(evs)["response.function_call_arguments.delta"]
+    assert delta["output_index"] == 2
+
