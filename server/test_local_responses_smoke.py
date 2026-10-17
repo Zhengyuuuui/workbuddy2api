@@ -9,6 +9,7 @@
 注：8787/8788 已被占用，本用例走 TestClient 进程内调用，不占端口。
 """
 import json
+import pathlib
 
 import httpx
 import pytest
@@ -17,7 +18,11 @@ from fastapi.testclient import TestClient
 import codebuddy_proxy
 from codebuddy_client_demo import CodeBuddyClient
 from codebuddy_proxy import ProxyState
-from responses_adapter import ResponsesStreamConverter
+from responses_adapter import (
+    ResponsesStreamConverter,
+    _convert_tools_for_chat,
+    responses_request_to_chat,
+)
 
 GOOD = 'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}'
 
@@ -239,4 +244,80 @@ def test_function_call_output_index_follows_index():
         {"index": 2, "id": "fc2", "function": {"name": "b", "arguments": "{}"}}]}}]})
     delta = dict(evs)["response.function_call_arguments.delta"]
     assert delta["output_index"] == 2
+
+
+# --- 7) 回归锁定：Codex 的 Responses 工具必须过滤掉 chat 不认的类型 --------
+
+def test_namespace_tools_are_dropped():
+    """Codex (wire_api=responses) 会发 namespace 类型工具，它没有 parameters。
+    转成空 schema 的 function 会让上游以 code 11129
+    'invalid function call parameters' 拒绝整个请求 Codex 侧表现为
+    stream closed before response.completed。"""
+    tools = [
+        {"type": "function", "name": "shell",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+        {"type": "namespace", "name": "mcp__node_repl",
+         "description": "...", "tools": [{"name": "js"}]},
+    ]
+    out = _convert_tools_for_chat(tools)
+    assert [t["function"]["name"] for t in out] == ["shell"]
+
+
+def test_web_search_tool_is_dropped():
+    tools = [
+        {"type": "function", "name": "shell",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+        {"type": "web_search", "external_web_access": True},
+    ]
+    out = _convert_tools_for_chat(tools)
+    assert [t["function"]["name"] for t in out] == ["shell"]
+
+
+def test_empty_parameters_is_dropped():
+    """空 properties 的 function 工具同样会被上游拒。"""
+    tools = [{"type": "function", "name": "noop",
+              "parameters": {"type": "object", "properties": {}}}]
+    assert _convert_tools_for_chat(tools) == []
+
+
+def test_chat_format_tool_is_validated_not_passed_through():
+    """已是 chat 格式的工具也要校验 parameters，不能再原样透传。"""
+    tools = [{"type": "function",
+              "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}}]
+    assert _convert_tools_for_chat(tools) == []
+
+
+def test_all_tools_filtered_out_yields_empty_list():
+    tools = [{"type": "namespace", "name": "ns"}, {"type": "web_search"}]
+    assert _convert_tools_for_chat(tools) == []
+
+
+def test_real_codex_request_converts_to_valid_chat_body():
+    """端到端：Codex 真实请求体经 responses_request_to_chat 后，
+    所有 tools 都必须是带非空 properties 的 function。
+
+    只取带 tools 的 dump（目录里可能混有自测用的无 tools 请求）。
+    """
+    dump = pathlib.Path("logs/req-dump")
+    samples = sorted(dump.glob("req-*.json")) if dump.exists() else []
+    bodies = []
+    for f in samples:
+        try:
+            b = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if b.get("tools"):
+            bodies.append(b)
+    if not bodies:
+        pytest.skip("无 Codex 请求 dump（CODEBUDDY_DUMP_REQ=1 时才会生成）")
+    body = bodies[0]
+    chat = responses_request_to_chat(body)
+    tools = chat.get("tools") or []
+    assert tools, "过滤后 tools 不应为空（Codex 有 16 个工具）"
+    for t in tools:
+        assert t["type"] == "function"
+        assert t["function"]["parameters"].get("properties"), t["function"]["name"]
+    # 16 个原始工具里 5 个非 function，应被过滤
+    assert len(tools) < len(body["tools"]), "非 function 工具应被过滤掉"
+
 

@@ -42,31 +42,82 @@ def _extract_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
+# 上游 chat/completions 只认 {"type":"function","function":{...}} 这一种工具定义。
+# Codex 客户端（wire_api=responses）还会发 namespace / web_search / local_shell 等
+# Responses 专有类型，原样转发会被上游以 code 11129
+# "invalid function call parameters" 整体拒绝（详见 _convert_tools_for_chat）。
+_CHAT_TOOL_TYPES = {"function"}
+
+
+def _chat_tool_parameters(params: Any) -> dict | None:
+    """校验并归一化工具的 JSON Schema 参数，不合法返回 None（调用方丢弃该工具）。
+
+    上游对 parameters 要求：
+      - 必须是 object
+      - type 必须为 "object"（有的是 "$schema"/"properties" 而无 type）
+      - properties 非空（namespace 类工具天然没有，会被丢）
+    空 schema 的 function 工具同样会被上游拒，故一并视为不合法。
+    """
+    if not isinstance(params, dict):
+        return None
+    if params.get("type") != "object":
+        return None
+    props = params.get("properties")
+    if not isinstance(props, dict) or not props:
+        return None
+    return params
+
+
 def _convert_tools_for_chat(tools: list[dict]) -> list[dict]:
     """将Responses工具格式转换为Chat格式
-    
+
     Responses: {name, description, parameters, strict}
-    Chat: {type: "function", function: {name, description, parameters, strict}}
+    Chat: {type: "function", "function": {name, description, parameters, strict}}
+
+    只保留上游能接受的 function 工具：
+      - Responses 专有类型（namespace / web_search / local_shell / custom_tool_call …）
+        一律丢弃——Codex 的 namespace 工具没有 parameters，转成空 schema 会让上游
+        以 11129 invalid function call parameters 拒绝整个请求。
+      - parameters 不是合法 JSON Schema 的同样丢弃。
+    若过滤后一个都不剩，返回 []（调用方据此不发送 tools 字段）。
     """
     result = []
     for tool in tools:
-        if tool.get("type") == "function" and tool.get("function"):
-            # 已经是Chat格式
-            result.append(tool)
-        elif tool.get("name"):
-            # Responses格式 → Chat格式
-            result.append({
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters", {}),
-                    **({"strict": tool["strict"]} if "strict" in tool else {}),
-                },
-            })
-        else:
-            # 未知格式，原样保留
-            result.append(tool)
+        if not isinstance(tool, dict):
+            continue
+        ttype = tool.get("type")
+        if ttype is not None and ttype not in _CHAT_TOOL_TYPES:
+            continue
+        # Chat 格式原样带进来的：仍要校验 parameters
+        if ttype == "function" and isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            params = _chat_tool_parameters(fn.get("parameters"))
+            if params is None:
+                continue
+            out: dict[str, Any] = {"type": "function", "function": {
+                "name": fn.get("name") or "",
+                "description": fn.get("description", ""),
+                "parameters": params,
+            }}
+            if "strict" in fn:
+                out["function"]["strict"] = fn["strict"]
+            result.append(out)
+            continue
+        # Responses 格式 → Chat 格式
+        name = tool.get("name")
+        if not name:
+            continue
+        params = _chat_tool_parameters(tool.get("parameters"))
+        if params is None:
+            continue
+        out = {"type": "function", "function": {
+            "name": name,
+            "description": tool.get("description", ""),
+            "parameters": params,
+        }}
+        if "strict" in tool:
+            out["function"]["strict"] = tool["strict"]
+        result.append(out)
     return result
 
 
