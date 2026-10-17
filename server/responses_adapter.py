@@ -241,10 +241,12 @@ def responses_request_to_chat(body: dict) -> dict:
     if "model" in body:
         chat["model"] = body["model"]
 
-    # tools
+    # tools：过滤掉 chat 不认的类型后，只剩空的就不发该字段
     tools = body.get("tools")
     if tools:
-        chat["tools"] = _convert_tools_for_chat(tools)
+        converted = _convert_tools_for_chat(tools)
+        if converted:
+            chat["tools"] = converted
     if "tool_choice" in body:
         chat["tool_choice"] = body["tool_choice"]
 

@@ -292,6 +292,24 @@ def test_all_tools_filtered_out_yields_empty_list():
     assert _convert_tools_for_chat(tools) == []
 
 
+def test_all_tools_filtered_out_omits_tools_key():
+    """全被过滤时不应再发 tools: [] —— 空数组对上游无意义。"""
+    body = {"model": "m", "stream": True, "input": "hi",
+            "tools": [{"type": "namespace", "name": "ns"}, {"type": "web_search"}]}
+    chat = responses_request_to_chat(body)
+    assert "tools" not in chat
+
+
+def test_surviving_tools_are_kept_when_some_filtered():
+    body = {"model": "m", "stream": True, "input": "hi", "tools": [
+        {"type": "function", "name": "shell",
+         "parameters": {"type": "object", "properties": {"c": {"type": "string"}}}},
+        {"type": "namespace", "name": "ns"},
+    ]}
+    chat = responses_request_to_chat(body)
+    assert [t["function"]["name"] for t in chat["tools"]] == ["shell"]
+
+
 def test_real_codex_request_converts_to_valid_chat_body():
     """端到端：Codex 真实请求体经 responses_request_to_chat 后，
     所有 tools 都必须是带非空 properties 的 function。
