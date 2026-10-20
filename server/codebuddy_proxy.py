@@ -1083,7 +1083,7 @@ async def list_models(refresh: int = 0):
         if live:
             models = live
     else:
-        # 国内 CodeBuddy 模型（逐个实测可用，共 32 个）
+        # 国内 CodeBuddy 模型（逐个实测可用，共 34 个）
         # 已移除：codewise-completions / codewise-default-model-v2（分别映射到已下线的
         #         completion-077 与 glm-4.7）、hunyuan-image-alpha（code 11103 后端不支持 chat）
         models = [
@@ -1111,6 +1111,8 @@ async def list_models(refresh: int = 0):
             {"id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "moonshot"},
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
             {"id": "minimax-m3.1-flash", "name": "MiniMax-M3.1-Flash", "vendor": "minimax"},
+            {"id": "mimo-v2.6-pro", "name": "Xiaomi MiMo-V2.6-Pro", "vendor": "xiaomi"},
+            {"id": "step-5-preview", "name": "Step-5-Preview", "vendor": "stepfun"},
             {"id": "minimax-m2.7", "name": "MiniMax-M2.7", "vendor": "minimax"},
             {"id": "space-bunny", "name": "Space-Bunny", "vendor": "tencent"},
             {"id": "deepseek-v4-pro", "name": "Deepseek-V4-Pro", "vendor": "deepseek"},

@@ -36,7 +36,7 @@
 | **认证 platform** | `VSCode` | `workbuddy-ai` |
 | **Session 文件** | `~/.codebuddy-session.json` | `~/.workbuddy-ai-session.json` |
 | **默认端口** | `8787` | `8788`（自定义） |
-| **模型特点** | 国产模型为主（GLM / DeepSeek / Kimi / MiniMax / 混元） | GPT-5.3-Codex + 与国内共用的国产模型 |
+| **模型特点** | 国产模型为主（GLM / DeepSeek / Kimi / MiniMax / MiMo / StepFun / 混元） | GPT-5.3-Codex + StepFun + 与国内共用的国产模型 |
 
 两个平台使用**完全相同的认证协议**（`cli-external-link`，`/v2/plugin/` 前缀），
 因此本项目复用同一套认证与代理逻辑，仅 endpoint / platform / session 不同。
@@ -194,7 +194,7 @@ model_provider = "codebuddy"
 
 ## 模型列表
 
-### 国内版 CodeBuddy（32 个，逐个实测可用）
+### 国内版 CodeBuddy（34 个，逐个实测可用）
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
@@ -223,6 +223,8 @@ model_provider = "codebuddy"
 | `minimax-m3` | MiniMax-M3 | minimax |
 | `minimax-m3.1-flash` | MiniMax-M3.1-Flash | minimax |
 | `minimax-m2.7` | MiniMax-M2.7 | minimax |
+| `mimo-v2.6-pro` | Xiaomi MiMo-V2.6-Pro | xiaomi |
+| `step-5-preview` | Step-5-Preview | stepfun |
 | `space-bunny` | Space-Bunny | tencent |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | deepseek |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | deepseek |

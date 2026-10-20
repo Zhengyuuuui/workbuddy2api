@@ -52,6 +52,10 @@ CANDIDATES: list[str] = [
     "kimi-k2.6", "kimi-k2.5", "kimi",
     # MiniMax
     "minimax-m3", "minimax-m3.1-flash", "minimax-m2.7",
+    # 小米 MiMo / 阶跃星辰 StepFun
+    "mimo-v2.6-pro", "mimo-v2.6", "mimo-v2", "mimo-v1", "mimo-7b", "mimo-vl",
+    "step-5-preview", "step-5", "step-3", "step-2", "step-r1", "step-1v",
+    "step-2-16k",
     # OpenAI / Google / Anthropic
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
     "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash", "o4-mini",
