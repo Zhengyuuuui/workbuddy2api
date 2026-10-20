@@ -248,10 +248,20 @@ class WorkBuddyAIClient:
     def fetch_cloud_config(self) -> dict[str, Any]:
         """拉取 /v3/config?repos= 云端产品配置（含 endpoint / models）。"""
         self.ensure_authenticated()
+        # 上游会校验 IDE 指纹，缺失时返回 400 code 12403 check ua。
+        headers = {
+            "User-Agent": "CodeBuddyIDE/4.10.33259736",
+            "X-Product": "SaaS",
+            "X-IDE-Type": "VSCode",
+            "X-IDE-Name": "VSCode",
+            "X-IDE-Version": "1.70.2",
+            "X-Product-Version": "4.10.33259736",
+            **self.auth_headers(),
+        }
         payload = self._request(
             "GET",
             "/v3/config?repos=",
-            headers=self.auth_headers(),
+            headers=headers,
             timeout=30,
         )
         return self._unwrap(payload) if isinstance(payload, dict) else payload

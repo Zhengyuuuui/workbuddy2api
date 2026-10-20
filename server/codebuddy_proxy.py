@@ -857,41 +857,55 @@ async def list_models():
     )
     
     if overseas:
-        # 海外 WorkBuddy AI 模型（实测可用，共 21 个）
+        # 海外 WorkBuddy AI 模型（personal_free_user 账号实测可用，共 22 个）
+        # 已移除（免费账号下不可用）：
+        #   primary-model / gpt-5.6-sol|terra|luna / gpt-5.5 / gpt-5.4 / gemini-3.5-flash
+        #     -> code 11158 not allowed for user type [personal_free_user]
+        #   deep-model -> code 11102 service info not found（已下线）
+        #   codewise-jump / nes-gf / default / hunyuan-chat -> code 11102
+        #   codewise-rewrite / nes-1.1 / nes-1.2 -> code 11134 上游临时不可用
         models = [
             {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
             {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
             {"id": "balanced-model", "name": "Balanced", "vendor": "codebuddy"},
-            {"id": "primary-model", "name": "Primary", "vendor": "codebuddy"},
-            {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
+            {"id": "auto", "name": "Auto", "vendor": "codebuddy"},
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy4-preview-f", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
-            {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "vendor": "openai"},
-            {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "vendor": "openai"},
-            {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "vendor": "openai"},
-            {"id": "gpt-5.5", "name": "GPT-5.5", "vendor": "openai"},
-            {"id": "gpt-5.4", "name": "GPT-5.4", "vendor": "openai"},
             {"id": "gpt-5.3-codex", "name": "GPT-5.3-Codex", "vendor": "openai"},
-            {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "vendor": "google"},
             {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
+            {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash", "vendor": "zhipu"},
             {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
+            {"id": "glm-5.1", "name": "GLM-5.1", "vendor": "zhipu"},
+            {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "vendor": "zhipu"},
             {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
+            {"id": "kimi-k2.8-preview", "name": "Kimi-K2.8-Preview", "vendor": "moonshot"},
+            {"id": "kimi-k2.7", "name": "Kimi-K2.7-Code", "vendor": "moonshot"},
             {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
             {"id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "moonshot"},
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
+            {"id": "minimax-m3.1-flash", "name": "MiniMax-M3.1-Flash", "vendor": "minimax"},
+            {"id": "space-bunny", "name": "Space-Bunny", "vendor": "tencent"},
             {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
         ]
     else:
-        # 国内 CodeBuddy 模型（产品配置 + 实测补充，共 27 个）
+        # 国内 CodeBuddy 模型（逐个实测可用，共 32 个）
+        # 已移除：codewise-completions / codewise-default-model-v2（分别映射到已下线的
+        #         completion-077 与 glm-4.7）、hunyuan-image-alpha（code 11103 后端不支持 chat）
         models = [
             {"id": "auto", "name": "Auto", "vendor": "codebuddy"},
             {"id": "default", "name": "Default", "vendor": "codebuddy"},
+            {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
+            {"id": "balanced-model", "name": "Balanced", "vendor": "codebuddy"},
+            {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy4-preview-f", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
             {"id": "hy3-x", "name": "Hy3", "vendor": "tencent"},
             {"id": "hunyuan-chat", "name": "Hunyuan-Turbos", "vendor": "tencent"},
             {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
             {"id": "glm-5.3-flash", "name": "GLM-5.3-flash", "vendor": "zhipu"},
+            {"id": "glm-5.3-flashx", "name": "GLM-5.3-FlashX", "vendor": "zhipu"},
             {"id": "glm-5.2", "name": "GLM-5.2", "vendor": "zhipu"},
             {"id": "glm-5.1", "name": "GLM-5.1", "vendor": "zhipu"},
             {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "vendor": "zhipu"},
@@ -900,17 +914,16 @@ async def list_models():
             {"id": "kimi-k2.8-preview", "name": "Kimi-K2.8-Preview", "vendor": "moonshot"},
             {"id": "kimi-k2.7", "name": "Kimi-K2.7-Code", "vendor": "moonshot"},
             {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},
+            {"id": "kimi-k2.5", "name": "Kimi-K2.5", "vendor": "moonshot"},
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
+            {"id": "minimax-m3.1-flash", "name": "MiniMax-M3.1-Flash", "vendor": "minimax"},
             {"id": "minimax-m2.7", "name": "MiniMax-M2.7", "vendor": "minimax"},
             {"id": "space-bunny", "name": "Space-Bunny", "vendor": "tencent"},
             {"id": "deepseek-v4-pro", "name": "Deepseek-V4-Pro", "vendor": "deepseek"},
             {"id": "deepseek-v4-flash", "name": "Deepseek-V4-Flash", "vendor": "deepseek"},
             {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
-            {"id": "codewise-default-model-v2", "name": "Default", "vendor": "tencent"},
-            {"id": "codewise-completions", "name": "codewise-completions", "vendor": "tencent"},
             {"id": "codewise-rewrite", "name": "codewise-rewrite", "vendor": "tencent"},
             {"id": "codewise-jump", "name": "codewise-jump", "vendor": "tencent"},
-            {"id": "hunyuan-image-alpha", "name": "Hunyuan Image Alpha", "vendor": "tencent"},
             {"id": "nes-gf", "name": "nes-gf", "vendor": "tencent"},
         ]
     
@@ -1197,6 +1210,11 @@ async def forward_chat(
     # 官方 IDE 默认 max_tokens（客户端未指定时）
     if not upstream_body.get("max_tokens"):
         upstream_body["max_tokens"] = 393216
+    
+    # glm-5.1 必须显式携带 reasoning_effort，否则上游返回
+    # code 11150 "the reasoning effort value is not supported by the current model"。
+    if upstream_body.get("model") == "glm-5.1":
+        upstream_body.setdefault("reasoning_effort", "medium")
     
     # 应用脱敏处理
     if state.enable_desensitize:

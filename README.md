@@ -20,7 +20,7 @@
 **同一个 proxy，两个平台，一套模型池：**
 
 - 🇨🇳 **国内 CodeBuddy**（`copilot.tencent.com`）→ GLM-5.3、DeepSeek-V4、Kimi-K3、MiniMax-M3、混元 Hy4 等**国产模型**
-- 🌍 **海外 WorkBuddy AI**（`www.workbuddy.ai`）→ **GPT-5.6-Sol/Terra/Luna、GPT-5.5、GPT-5.4、GPT-5.3-Codex、Gemini-3.5-Flash** 等海外模型，外加 GLM / Kimi / 混元
+- 🌍 **海外 WorkBuddy AI**（`www.workbuddy.ai`）→ **GPT-5.3-Codex** 等海外模型，外加 GLM / Kimi / 混元 / MiniMax / DeepSeek
 
 两个平台使用**完全相同的认证协议**，因此本项目复用同一套代码，启动参数一键切换。
 国内跑不了的 GPT / Gemini 系列，走海外端口即可使用。
@@ -36,7 +36,7 @@
 | **认证 platform** | `VSCode` | `workbuddy-ai` |
 | **Session 文件** | `~/.codebuddy-session.json` | `~/.workbuddy-ai-session.json` |
 | **默认端口** | `8787` | `8788`（自定义） |
-| **模型特点** | 国产模型为主（GLM / DeepSeek / Kimi / MiniMax / 混元） | 含 GPT-5.6 / Gemini 等海外模型 |
+| **模型特点** | 国产模型为主（GLM / DeepSeek / Kimi / MiniMax / 混元） | GPT-5.3-Codex + 与国内共用的国产模型 |
 
 两个平台使用**完全相同的认证协议**（`cli-external-link`，`/v2/plugin/` 前缀），
 因此本项目复用同一套认证与代理逻辑，仅 endpoint / platform / session 不同。
@@ -55,6 +55,7 @@ workbuddy2api/
 │   ├── responses_projection.py      # 消息压缩
 │   ├── projection_metadata.py       # 压缩元数据
 │   ├── anthropic_adapter.py         # Anthropic API 转换
+│   ├── probe_models.py              # 实测探测上游可用模型
 │   ├── extract_device_token.py      # x-device-token 抓取
 │   └── test_*.py                    # 测试
 ├── pyproject.toml
@@ -193,73 +194,115 @@ model_provider = "codebuddy"
 
 ## 模型列表
 
-### 国内版 CodeBuddy（28 个）
+### 国内版 CodeBuddy（32 个，逐个实测可用）
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
 | `auto` | Auto | codebuddy |
 | `default` | Default | codebuddy |
+| `fast-model` | Fast | codebuddy |
+| `balanced-model` | Balanced | codebuddy |
+| `deep-model` | Deep | codebuddy |
 | `hy4-preview` | Hy4 preview | tencent |
+| `hy4-preview-f` | Hy4 preview | tencent |
 | `hy3` | Hy3 | tencent |
 | `hy3-x` | Hy3 | tencent |
 | `hunyuan-chat` | Hunyuan-Turbos | tencent |
 | `glm-5.3` | GLM-5.3 | zhipu |
 | `glm-5.3-flash` | GLM-5.3-flash | zhipu |
+| `glm-5.3-flashx` | GLM-5.3-FlashX | zhipu |
 | `glm-5.2` | GLM-5.2 | zhipu |
 | `glm-5.1` | GLM-5.1 | zhipu |
 | `glm-5v-turbo` | GLM-5v-Turbo | zhipu |
 | `kimi-k3` | Kimi-K3 | moonshot |
-| `kimi-k3-1` | Kimi-K3.1（未公开发布） | moonshot |
+| `kimi-k3-1` | Kimi-K3.1 | moonshot |
 | `kimi-k2.8-preview` | Kimi-K2.8-Preview | moonshot |
 | `kimi-k2.7` | Kimi-K2.7-Code | moonshot |
 | `kimi-k2.6` | Kimi-K2.6 | moonshot |
+| `kimi-k2.5` | Kimi-K2.5 | moonshot |
 | `minimax-m3` | MiniMax-M3 | minimax |
+| `minimax-m3.1-flash` | MiniMax-M3.1-Flash | minimax |
 | `minimax-m2.7` | MiniMax-M2.7 | minimax |
 | `space-bunny` | Space-Bunny | tencent |
 | `deepseek-v4-pro` | Deepseek-V4-Pro | deepseek |
 | `deepseek-v4-flash` | Deepseek-V4-Flash | deepseek |
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
-| `codewise-default-model-v2` | Default（补全） | tencent |
-| `codewise-completions` | codewise-completions | tencent |
 | `codewise-rewrite` | codewise-rewrite | tencent |
 | `codewise-jump` | codewise-jump | tencent |
-| `hunyuan-image-alpha` | Hunyuan Image Alpha | tencent |
 | `nes-gf` | nes-gf | tencent |
 
-### 海外版 WorkBuddy AI（21 个）
+> `glm-5.1` 必须携带 `reasoning_effort`（proxy 会自动补 `medium`），
+> 否则上游返回 `code 11150`。它会先输出推理内容，`max_tokens` 过小可能只得到空回复。
+
+### 海外版 WorkBuddy AI（22 个，逐个实测可用）
+
+> 以下为 `personal_free_user` 免费账号实测可用的模型。
+> 免费账号下 GPT-5.6 / GPT-5.5 / GPT-5.4 / Gemini-3.5 / `primary-model` 会被拒
+> （`code 11158 not allowed for user type`）；`deep-model` 等已下线（`code 11102`）。
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
 | `default-model` | Auto | codebuddy |
 | `fast-model` | Fast | codebuddy |
 | `balanced-model` | Balanced | codebuddy |
-| `primary-model` | Primary | codebuddy |
-| `deep-model` | Deep | codebuddy |
+| `auto` | Auto | codebuddy |
 | `hy4-preview` | Hy4 preview | tencent |
+| `hy4-preview-f` | Hy4 preview | tencent |
 | `hy3` | Hy3 | tencent |
-| `gpt-5.6-sol` | GPT-5.6-Sol | openai |
-| `gpt-5.6-terra` | GPT-5.6-Terra | openai |
-| `gpt-5.6-luna` | GPT-5.6-Luna | openai |
-| `gpt-5.5` | GPT-5.5 | openai |
-| `gpt-5.4` | GPT-5.4 | openai |
 | `gpt-5.3-codex` | GPT-5.3-Codex | openai |
-| `gemini-3.5-flash` | Gemini-3.5-Flash | google |
 | `glm-5.3` | GLM-5.3 | zhipu |
+| `glm-5.3-flash` | GLM-5.3-Flash | zhipu |
 | `glm-5.2` | GLM-5.2 | zhipu |
+| `glm-5.1` | GLM-5.1 | zhipu |
+| `glm-5v-turbo` | GLM-5v-Turbo | zhipu |
 | `kimi-k3` | Kimi-K3 | moonshot |
+| `kimi-k2.8-preview` | Kimi-K2.8-Preview | moonshot |
+| `kimi-k2.7` | Kimi-K2.7-Code | moonshot |
 | `kimi-k2.6` | Kimi-K2.6 | moonshot |
 | `kimi-k2.5` | Kimi-K2.5 | moonshot |
 | `minimax-m3` | MiniMax-M3 | minimax |
+| `minimax-m3.1-flash` | MiniMax-M3.1-Flash | minimax |
+| `space-bunny` | Space-Bunny | tencent |
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
 
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
 
-### 同步上游模型列表
+### 探测上游可用模型
 
-`/v1/models` 里的列表是硬编码的。上游发新模型后，可直接拉取云端配置核对：
+`/v1/models` 里的列表是硬编码的。用 `probe_models.py` 逐个发真实请求来验证/更新：
 
 ```bash
-# 国内版
+# 先启动 proxy，再探测
+uv run server/probe_models.py                       # 国内版（8787）
+uv run server/probe_models.py --port 8788           # 海外版（8788）
+uv run server/probe_models.py --extra "glm-9.9"     # 追加自定义候选
+uv run server/probe_models.py --from-config         # 顺便从云端配置收集候选
+```
+
+输出会按可用/不可用分组，并标注上游错误码：
+
+| 错误码 | 含义 |
+|---|---|
+| `11102` | `service info not found` —— 模型不存在或已下线 |
+| `11158` | `not allowed for user type` —— 账号权限不足（免费账号用不了 GPT/Gemini） |
+| `11103` | 后端不支持该调用方式（如图像模型走 chat） |
+| `11134` | 上游临时不可用，稍后重试 |
+| `11150` | `reasoning effort` 不支持 —— `glm-5.1` 假失败，proxy 会自动补参数 |
+
+> ⚠️ **`/v3/config?repos=` 的 `models` 不能直接当可用列表**。实测云端会列出已下线的条目
+> （海外版返回 `auto-chat`、`o4-mini`、`enhance-1.0`，调用全部 `11102`），也会漏掉实际可用的
+> 模型（云端配置里没有 GLM / Kimi / DeepSeek）。反之 `gpt-5.6-*` 未出现在云端配置中，
+> 但在付费账号下可用。**唯一可靠方式是实测。**
+
+<details>
+<summary>手动拉取云端配置</summary>
+
+```bash
+# 海外版
+uv run server/workbuddy_ai_client_demo.py --config
+
+# 国内版（注意 User-Agent 必须是 CodeBuddyIDE/<version>，
+# 否则返回 HTTP 400 code 12403 check ua）
 uv run python -c "
 import sys; sys.path.insert(0, 'server')
 from codebuddy_client_demo import CodeBuddyClient
@@ -271,13 +314,9 @@ h = {'User-Agent': 'CodeBuddyIDE/4.10.33259736', 'X-Product': 'SaaS',
 cfg = c._unwrap(c._request('GET', '/v3/config?repos=', headers={**h, **c.auth_headers()}))
 for m in cfg.get('models') or []: print(' ', m.get('id'), '|', m.get('name'))
 "
-
-# 海外版
-uv run server/workbuddy_ai_client_demo.py --config
 ```
 
-> `User-Agent` 必须是 `CodeBuddyIDE/<version>` 形式，否则上游返回
-> `HTTP 400 / code 12403 check ua, get coding copilot version error`。
+</details>
 
 ## 命令行参数
 
