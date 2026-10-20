@@ -21,6 +21,8 @@ from fastapi.testclient import TestClient
 import codebuddy_proxy
 from codebuddy_client_demo import CodeBuddyClient
 from codebuddy_proxy import (
+    INTL_CLIENT_UA,
+    INTL_CLI_VERSION,
     INTL_IDE_VERSION,
     OFFICIAL_IDE_VERSION,
     ProxyState,
@@ -283,13 +285,15 @@ class TestIntlOfficialHeaderParity:
     def test_intl_fingerprint_values(self, captured):
         self._post_intl()
         headers = captured[0]["headers"]
-        assert headers["user-agent"] == f"WorkBuddy/{INTL_IDE_VERSION} WorkBuddy/{INTL_IDE_VERSION} CLI/2.137.1"
+        assert headers["user-agent"] == INTL_CLIENT_UA
         assert headers["x-ide-name"] == "WorkBuddy"
         assert headers["x-ide-version"] == INTL_IDE_VERSION
         assert headers["x-product"] == "SaaS"
         assert headers["x-agent-purpose"] == "conversation"
         assert headers["x-stainless-runtime"] == "node"
-        assert INTL_IDE_VERSION == "5.5.2"
+        # 官方真实客户端版本（2026-10-09 本机 WorkBuddyAI.exe 抓包实测）
+        assert INTL_IDE_VERSION == "5.7.6"
+        assert INTL_CLI_VERSION == "2.156.0"
         # 官方行为：X-Request-ID 与 X-Conversation-Message-ID 同值
         assert headers["x-request-id"] == headers["x-conversation-message-id"]
         assert headers["x-request-id"] != headers["x-conversation-request-id"]

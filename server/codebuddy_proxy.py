@@ -175,6 +175,8 @@ class ProxyState:
         self._usage_events: deque[tuple[float, float]] = deque()
         self._credits_total_remain: float | None = None  # 最近一次成功获取的剩余额度
         self._credits_cache: dict[str, Any] | None = None  # {"fetched_at": float, "payload": dict}
+        # 云端模型列表缓存（/v3/config）：{"fetched_at": float, "models": list[dict]}
+        self._cloud_models_cache: dict[str, Any] | None = None
         self._burn_warned = False
         # 客户端会话键（body 轻量指纹）→ conversation_id，模拟 IDE 会话链路
         self._conversations: dict[str, str] = {}
@@ -337,9 +339,16 @@ def get_state() -> ProxyState:
 # ============================================================================
 
 OFFICIAL_IDE_VERSION = "4.12.0"
-# 国际版官方客户端指纹（2026-09-25 mitm 抓包实测，见 doc/HANDOFF-intl-token.md）
-INTL_IDE_VERSION = "5.5.2"
-INTL_CLIENT_UA = f"WorkBuddy/{INTL_IDE_VERSION} WorkBuddy/{INTL_IDE_VERSION} CLI/2.137.1"
+# 国际版官方客户端指纹。
+# 2026-10-09 实测（本机 WorkBuddyAI.exe 5.7.6 抓包，见 wb/capture/chat2_dump.jsonl）：
+#   官方真实 UA = `workbuddy-ai/5.7.6 workbuddy-ai/5.7.6 CLI/2.156.0`（全小写，
+#   与旧版 `WorkBuddy/5.5.2 ... CLI/2.137.1` 大小写与版本号都不同）。
+# 旧值 5.5.2/2.137.1 来自 2026-09-25 抓包（doc/HANDOFF-intl-token.md），已过期。
+INTL_IDE_VERSION = "5.7.6"
+INTL_CLI_VERSION = "2.156.0"
+INTL_CLIENT_UA = (
+    f"workbuddy-ai/{INTL_IDE_VERSION} workbuddy-ai/{INTL_IDE_VERSION} CLI/{INTL_CLI_VERSION}"
+)
 
 
 def _hex32() -> str:
@@ -838,12 +847,165 @@ async def health():
     }
 
 
+def _guess_vendor(model_id: str) -> str:
+    """按 id 前缀猜测厂商（上游 /v3/config 的 vendor 是 e/f/j/i 等档位码，
+    不是厂商名，无法直接用于 owned_by，故沿用本文件的命名风格推断）。"""
+    mid = (model_id or "").lower()
+    if mid.startswith(("gpt-", "chatgpt")):
+        return "openai"
+    if mid.startswith("gemini"):
+        return "google"
+    if mid.startswith("glm"):
+        return "zhipu"
+    if mid.startswith("kimi"):
+        return "moonshot"
+    if mid.startswith(("deepseek", "deepseek-")):
+        return "deepseek"
+    if mid.startswith(("hy", "hunyuan", "space-bunny", "nes-")):
+        return "tencent"
+    if mid.startswith("grok"):
+        return "xai"
+    if mid.startswith("minimax"):
+        return "minimax"
+    if mid.startswith("seedance"):
+        return "bytedance"
+    if mid.startswith("step-"):
+        return "stepfun"
+    return "codebuddy"
+
+
+def _parse_credit_rate(raw: Any) -> float | None:
+    """解析上游 credits 字段里的倍率。
+
+    实测上游取值有四种形态（2026-10-15 /v3/config）：
+      'x0.34 credits' / 'x0.77' / ''（未定价）/ None
+    只取首个 x 之后的数字；解析不出或非数字返回 None。
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    m = re.search(r"x\s*([0-9]+(?:\.[0-9]+)?)", text, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _decorate_model_name(name: str, rate: float | None) -> str:
+    """把倍率附到展示名后面，便于客户端挑便宜模型：'Fast' -> 'Fast (x0.34)'。
+
+    固定两位小数：上游 credits 一律两位（x0.00 / x0.34 / x3.31），
+    用 :g 会把 x0.00 显示成 x0、x1.90 显示成 x1.9，与上游不一致。
+    """
+    if rate is None:
+        return name
+    return f"{name} (x{rate:.2f})"
+
+
+# /v1/models 的 id 上附加的倍率后缀，形如 " (x0.34)"。用于让只展示 id 的客户端
+# （如 cc-switch）也能看到消耗倍率。转发到上游前必须剥掉——上游不认识这个后缀。
+_CREDIT_SUFFIX_RE = re.compile(r"\s*\(\s*x\s*[0-9]+(?:\.[0-9]+)?\s*\)\s*$", re.IGNORECASE)
+# 上下文长度标记（cc-switch/Claude Code 会写 hy4-preview-f[1M]），上游同样不认
+_CONTEXT_TAG_RE = re.compile(r"\s*\[\s*\d+\s*[kKmM]\s*\]\s*$")
+
+
+def _decorate_model_id(model_id: str, rate: float | None) -> str:
+    """给 /v1/models 里返回的 id 附上倍率：'fast-model' -> 'fast-model (x0.34)'。
+
+    只改对外展示的 id；转发时由 _normalize_model_id() 剥回真 id。
+    """
+    if rate is None or not model_id:
+        return model_id
+    return f"{model_id} (x{rate:.2f})"
+
+
+def _normalize_model_id(model: Any) -> Any:
+    """把客户端回传的展示用模型名还原成上游真 id。
+
+    客户端（cc-switch / Claude Code 等）会把 /v1/models 里的 id 原样回传，
+    因此可能带上我们附加的倍率后缀 " (x0.34)"，也可能带上下文标记 "[1M]"。
+    两者上游都不认识，需在转发前剥掉；非字符串或没有后缀时原样返回。
+    """
+    if not isinstance(model, str) or not model:
+        return model
+    cleaned = _CREDIT_SUFFIX_RE.sub("", model)
+    cleaned = _CONTEXT_TAG_RE.sub("", cleaned).strip()
+    return cleaned or model
+
+
+async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
+    """从上游 /v3/config 拉取云端模型列表；失败返回 None（调用方回退到硬编码列表）。
+
+    海外端点必须带官方 UA，否则服务端以 400
+    "check ua, get coding copilot version error" 拒绝（2026-10-09 实测）。
+    """
+    url = state.client.endpoint.rstrip("/") + "/v3/config"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=30.0), trust_env=False) as client:
+            resp = await client.get(
+                url,
+                params={"repos": ""},
+                headers={
+                    **state.client.auth_headers(),
+                    "User-Agent": INTL_CLIENT_UA,
+                    "Accept": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        diagnostic("cloud_models_fetch_error", error=str(exc)[:200])
+        return None
+    if resp.status_code != 200:
+        diagnostic("cloud_models_fetch_error", http_status=resp.status_code,
+                   detail=resp.text[:300])
+        return None
+    try:
+        payload = resp.json()
+    except ValueError:
+        diagnostic("cloud_models_fetch_error", detail="non-JSON response")
+        return None
+    # /v3/config 统一包 {"code":0,"data":{...,"models":[...]}}
+    node = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(node, dict) and isinstance(node.get("data"), dict):
+        node = node["data"]
+    models = (node or {}).get("models") if isinstance(node, dict) else None
+    if not isinstance(models, list):
+        return None
+    out: list[dict[str, Any]] = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if not mid:
+            continue
+        name = m.get("name") or str(mid)
+        rate = _parse_credit_rate(m.get("credits"))
+        out.append({
+            # id 也带上倍率，让只看 id 的客户端（cc-switch）可见；
+            # 转发时 _normalize_model_id() 会剥掉，不影响上游
+            "id": _decorate_model_id(str(mid), rate),
+            "name": _decorate_model_name(name, rate),
+            "vendor": _guess_vendor(str(mid)),
+            # 原始倍率单独给一份，方便客户端自行排序/过滤，不依赖名字解析
+            "credit_rate": rate,
+        })
+    return out or None
+
+
 # ============================================================================
 # 端点：/v1/models
 # ============================================================================
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(refresh: int = 0):
+    """模型列表。
+
+    海外端点优先用上游 /v3/config 的实时列表（缓存 10 分钟，?refresh=1 强制刷新），
+    上游不可用/未登录时回退到内置快照，避免硬编码列表过期后与新上游不一致。
+    """
     state = get_state()
     log_client_request("GET", "/v1/models", None)
     state.ensure_auth()
@@ -857,14 +1019,14 @@ async def list_models():
     )
     
     if overseas:
-        # 海外 WorkBuddy AI 模型（personal_free_user 账号实测可用，共 22 个）
-        # 已移除（免费账号下不可用）：
-        #   primary-model / gpt-5.6-sol|terra|luna / gpt-5.5 / gpt-5.4 / gemini-3.5-flash
-        #     -> code 11158 not allowed for user type [personal_free_user]
-        #   deep-model -> code 11102 service info not found（已下线）
-        #   codewise-jump / nes-gf / default / hunyuan-chat -> code 11102
-        #   codewise-rewrite / nes-1.1 / nes-1.2 -> code 11134 上游临时不可用
+        # 海外 WorkBuddy AI 模型快照。仅作为上游 /v3/config 不可用时的回退，
+        # 实时列表优先，见上方 _fetch_cloud_models。
+        # 标注 [实测] 的是逐个请求验证可用的；其余来自上游 /v3/config 快照，
+        # 在 personal_free_user 账号下多数不可用（11158 权限 / 11102 已下线）。
+        # ⚠️ /v3/config 实时列表会把 11158/11102 的模型也列出来（如 gpt-6-*、
+        #    gemini-3.8-flash、grok-4.7、primary-model），客户端仍会选中后报错。
         models = [
+            # --- [实测] personal_free_user 可用 ---
             {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
             {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
             {"id": "balanced-model", "name": "Balanced", "vendor": "codebuddy"},
@@ -886,8 +1048,40 @@ async def list_models():
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
             {"id": "minimax-m3.1-flash", "name": "MiniMax-M3.1-Flash", "vendor": "minimax"},
             {"id": "space-bunny", "name": "Space-Bunny", "vendor": "tencent"},
+            {"id": "step-5-preview", "name": "Step-5-Preview", "vendor": "stepfun"},
             {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
+            # --- 上游 /v3/config 快照，未在免费账号实测 ---
+            {"id": "primary-model", "name": "Primary", "vendor": "codebuddy"},
+            {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
+            {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "vendor": "openai"},
+            {"id": "gpt-5.6-luna", "name": "GPT-5.6-Luna", "vendor": "openai"},
+            {"id": "gpt-6-sol", "name": "GPT-6-Sol", "vendor": "openai"},
+            {"id": "gpt-6-luna", "name": "GPT-6-Luna", "vendor": "openai"},
+            {"id": "gpt-5.5", "name": "GPT-5.5", "vendor": "openai"},
+            {"id": "gpt-5.4", "name": "GPT-5.4", "vendor": "openai"},
+            {"id": "gpt-image-2.5-sunburst", "name": "GPT-Image-2.5-Sunburst", "vendor": "openai"},
+            {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "vendor": "google"},
+            {"id": "gemini-3.8-flash", "name": "Gemini-3.8-Flash", "vendor": "google"},
+            {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
+            {"id": "grok-4.7", "name": "Grok-4.7", "vendor": "xai"},
+            {"id": "seedance-2.5", "name": "Seedance-2.5", "vendor": "bytedance"},
+            {"id": "step-5-preview", "name": "Step-5-Preview", "vendor": "stepfun"},
         ]
+        # 实时优先：拉取上游 /v3/config（缓存 10 分钟），失败静默回退到快照
+        now = time.time()
+        cached = state._cloud_models_cache
+        live: list[dict[str, Any]] | None = None
+        if not refresh and cached and (now - cached["fetched_at"]) < 600:
+            live = cached["models"]
+        else:
+            live = await _fetch_cloud_models(state)
+            if live:
+                state._cloud_models_cache = {"fetched_at": now, "models": live}
+            elif cached:
+                # 刷新失败时继续用旧缓存，避免瞬时抖动把列表打空
+                live = cached["models"]
+        if live:
+            models = live
     else:
         # 国内 CodeBuddy 模型（逐个实测可用，共 32 个）
         # 已移除：codewise-completions / codewise-default-model-v2（分别映射到已下线的
@@ -934,10 +1128,12 @@ async def list_models():
             "created": 0,
             "owned_by": m.get("vendor", "codebuddy"),
             "name": m.get("name", m["id"]),
+            # 上游 credits 倍率（海外 /v3/config 实时列表才有；国内/快照为 None）
+            "credit_rate": m.get("credit_rate"),
         }
         for m in models
     ]
-    
+
     return {"object": "list", "data": data}
 
 
@@ -1156,14 +1352,28 @@ async def forward_chat(
     state = get_state()
     state.ensure_auth()
     
-    stream = bool(body.get("stream"))
+    # 用原始请求的 stream 意图（协议适配器可能改写 stream 字段，
+    # 但客户端的真实意图永远以 original 为准；openai 协议 original 为 None，退回 body）
+    source = original if original is not None else body
+    stream = bool(source.get("stream"))
     upstream_body = dict(body)
+    # 客户端可能把 /v1/models 里带倍率后缀的 id 原样回传（"fast-model (x0.34)"），
+    # 也可能带 [1M] 上下文标记；转发前统一还原成上游真 id。
+    if "model" in upstream_body:
+        raw_model = upstream_body.get("model")
+        normalized = _normalize_model_id(raw_model)
+        if normalized != raw_model:
+            diagnostic("model_id_normalized", protocol=protocol,
+                       from_model=raw_model, to_model=normalized)
+            upstream_body["model"] = normalized
     conv_id = state.get_conversation_id(upstream_body)
     
     diagnostic("upstream_request", protocol=protocol, conv_id=conv_id, **body_summary(body))
     
     # P2 熔断：冷却期内快速失败，不打上游（429 与 5xx 熔断统一拒绝格式）
-    model = body.get("model", "")
+    # 用规范化后的 id：同一模型的 "fast-model" 与 "fast-model (x0.34)" 必须
+    # 共用同一熔断器条目，否则换倍率后缀就绕过了熔断。
+    model = upstream_body.get("model", "") or ""
     tripped, remaining = state.breaker.check(state.client.endpoint, model)
     if tripped:
         seconds = max(1, math.ceil(remaining))
@@ -1371,7 +1581,7 @@ async def stream_upstream(
     
     # Responses 协议转换器
     responses_state = ResponsesStreamConverter(
-        model=upstream_body.get("model", "auto")
+        model=body.get("model", "auto")
     ) if protocol == "responses" and ResponsesStreamConverter else None
     
     # DSML 缓冲区（用于处理可能的文本标记格式工具调用）
@@ -1380,6 +1590,8 @@ async def stream_upstream(
     emitted_response_created = False
     response_text = ""
     response_text_started = False
+    # 协议结束事件（response.completed / message_stop）是否已下发，防止重复收尾
+    finish_emitted = False
     chunk_count = 0
     done_seen = False
     upstream_response_id: str | None = None
@@ -1584,49 +1796,22 @@ async def stream_upstream(
                         for event_name, event_data in events:
                             yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 
-                # 发送结束事件
-                if protocol == "responses" and response_text_started:
-                    for event_name, payload in [
-                        ("response.output_text.done", {
-                            "type": "response.output_text.done",
-                            "item_id": response_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "text": response_text
-                        }),
-                        ("response.content_part.done", {
-                            "type": "response.content_part.done",
-                            "item_id": response_id,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "part": {"type": "output_text", "text": response_text, "annotations": []}
-                        }),
-                        ("response.output_item.done", {
-                            "type": "response.output_item.done",
-                            "output_index": 0,
-                            "item": {
-                                "id": response_id,
-                                "type": "message",
-                                "role": "assistant",
-                                "content": [{"type": "output_text", "text": response_text, "annotations": []}]
-                            }
-                        }),
-                        ("response.completed", {
-                            "type": "response.completed",
-                            "response": {
-                                "id": response_id,
-                                "object": "response",
-                                "status": "completed",
-                                "output_text": response_text
-                            }
-                        }),
-                    ]:
-                        yield f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
-                
+                # 发送结束事件。finish_emitted 保证整个流只结束一次：
+                # 正常路径结束后若 aclose()/尾部读取再抛 TransportError，
+                # 下面的恢复分支不会重复补发 completed（ResponsesStreamConverter
+                # .finish() 自身不是幂等的）。
+                if protocol == "responses" and responses_state:
+                    if not finish_emitted:
+                        finish_emitted = True
+                        for event_name, event_data in responses_state.finish():
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 elif protocol == "anthropic" and anthropic_state:
-                    for event_name, event_data in anthropic_state.finish():
-                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
-                
+                    if not finish_emitted:
+                        finish_emitted = True
+                        for event_name, event_data in anthropic_state.finish():
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 elif protocol == "openai":
                     yield b"data: [DONE]\n\n"
 
@@ -1645,19 +1830,89 @@ async def stream_upstream(
             }
         }
         yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
-    
+
+    except httpx.TransportError as exc:
+        # 上游传输层中断：连接被重置 / SSE 流意外关闭 / 分块解码失败等。
+        # 通常是瞬时网络抖动。两种情形：
+        #   1) done_seen=True：尾部 [DONE] 之后连接才关，主体已完整，补发协议级
+        #      结束事件静默收尾（否则 Responses 流会被 422 打断）。
+        #   2) 中途断裂（incomplete chunked read）：上游在内容发完前就掐断。
+        #      若已收到部分内容，最佳努力把已累积的内容作为完整响应补发结束事件
+        #      （Responses 返回截断文本但流程正常完成，避免 422）；只有当一帧都没
+        #      收到（无可用内容）时才回退到结构化 upstream_error。
+        diagnostic("stream_transport_error", protocol=protocol, chunks=chunk_count,
+            exc_type=type(exc).__name__, error=str(exc), done_seen=done_seen,
+            elapsed=round(time.time() - stream_start_time, 2))
+        state.write_log("stream_transport_error", protocol=protocol, chunks=chunk_count,
+            exc_type=type(exc).__name__, error=str(exc), done_seen=done_seen)
+        if protocol == "responses" and responses_state and not finish_emitted:
+            # 已在处理中（收到过文本或已 started）：把已累积内容作为完整响应收尾。
+            # 中途断裂时文本是截断的，但比直接 422 更可用，且客户端不会中断。
+            if done_seen or getattr(responses_state, "started", False) or responses_state.text:
+                finish_emitted = True
+                try:
+                    for event_name, event_data in responses_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                except Exception as fin_exc:
+                    diagnostic("finish_reemit_error", protocol=protocol, error=str(fin_exc))
+                return
+        elif protocol == "anthropic" and anthropic_state and not finish_emitted:
+            if done_seen or getattr(anthropic_state, "text", ""):
+                finish_emitted = True
+                try:
+                    for event_name, event_data in anthropic_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                except Exception as fin_exc:
+                    diagnostic("finish_reemit_error", protocol=protocol, error=str(fin_exc))
+                return
+        # 无可用内容：回退到结构化错误。
+        # 必须按协议正确定帧：Responses/Anthropic 用 `event: error` 帧，否则客户端
+        # 收到裸 `data:` 会触发 422 格式转换错误（本次报错的根因）。openai 用裸 data。
+        message = f"upstream stream interrupted: {type(exc).__name__}: {exc}"
+        if protocol == "responses":
+            err_event = {
+                "type": "error",
+                "error": {"type": "server_error", "message": message},
+            }
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        elif protocol == "anthropic":
+            err_event = {
+                "type": "error",
+                "error": {"type": "api_error", "message": message},
+            }
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        else:
+            error_chunk = {
+                "error": {
+                    "message": message,
+                    "type": "upstream_error",
+                }
+            }
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
+
     except Exception as exc:
-        # 【日志】其他错误
+        # 【日志】其他错误：保留异常类型与堆栈，便于定位（此前只记 str(exc)，
+        # 当异常 __str__ 为空时无从判断根因）。
+        import traceback as _tb
+        tb_text = _tb.format_exc()
         diagnostic("stream_error", protocol=protocol, chunks=chunk_count,
-            elapsed=round(time.time() - stream_start_time, 2), error=str(exc))
-        state.write_log("stream_error", protocol=protocol, chunks=chunk_count, error=str(exc))
+            exc_type=type(exc).__name__, error=str(exc),
+            elapsed=round(time.time() - stream_start_time, 2))
+        state.write_log("stream_error", protocol=protocol, chunks=chunk_count,
+            exc_type=type(exc).__name__, error=str(exc), traceback=tb_text)
         error_chunk = {
             "error": {
-                "message": f"stream error: {exc}",
+                "message": f"stream error: {type(exc).__name__}: {exc}",
                 "type": "internal_error"
             }
         }
-        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
+        if protocol == "responses":
+            yield f"event: error\ndata: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
+        elif protocol == "anthropic":
+            err_event = {"type": "error", "error": {"type": "api_error", "message": error_chunk["error"]["message"]}}
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        else:
+            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
     
     finally:
         # previous_response_id 会话延续：仅流正常结束（upstream_done）时记录

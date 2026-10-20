@@ -234,11 +234,11 @@ model_provider = "codebuddy"
 > `glm-5.1` 必须携带 `reasoning_effort`（proxy 会自动补 `medium`），
 > 否则上游返回 `code 11150`。它会先输出推理内容，`max_tokens` 过小可能只得到空回复。
 
-### 海外版 WorkBuddy AI（22 个，逐个实测可用）
+### 海外版 WorkBuddy AI（23 个，逐个实测可用）
 
 > 以下为 `personal_free_user` 免费账号实测可用的模型。
-> 免费账号下 GPT-5.6 / GPT-5.5 / GPT-5.4 / Gemini-3.5 / `primary-model` 会被拒
-> （`code 11158 not allowed for user type`）；`deep-model` 等已下线（`code 11102`）。
+> 免费账号下 GPT-5.6 / GPT-6 / GPT-5.5 / GPT-5.4 / Gemini / Grok / `primary-model`
+> 会被拒（`code 11158 not allowed for user type`）；`deep-model` 等已下线（`code 11102`）。
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
@@ -263,13 +263,34 @@ model_provider = "codebuddy"
 | `minimax-m3` | MiniMax-M3 | minimax |
 | `minimax-m3.1-flash` | MiniMax-M3.1-Flash | minimax |
 | `space-bunny` | Space-Bunny | tencent |
+| `step-5-preview` | Step-5-Preview | stepfun |
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
 
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
 
+#### 海外版 id 带 credits 倍率
+
+海外版 `/v1/models` 实时同步上游 `/v3/config`（缓存 10 分钟，`?refresh=1` 强制刷新），
+返回的 id 会附倍率后缀，方便按成本选模型：
+
+```
+fast-model (x0.34)      balanced-model (x3.31)   primary-model
+deepseek-v4.1-flash (x0.00)                      ← 免费
+step-5-preview (x0.00)                           ← 免费
+gpt-6-sol (x1.33)        gpt-6-astra (x6.67)     gemini-3.8-flash (x0.95)
+```
+
+proxy 转发时会自动把倍率后缀剥回真实 id（`fast-model (x0.34)` → `fast-model`），
+所以客户端把带后缀的 id 原样回传也能正常工作。
+
+> ⚠️ **实时列表会把不可用的模型也列出来**。上游 `/v3/config` 不按账号权限过滤，
+> 免费账号会看到 `gpt-6-*`、`gemini-3.8-flash`、`grok-4.7`、`primary-model` 等，
+> 选中后调用才报 `11158`。上表是实测可用的子集。
+
 ### 探测上游可用模型
 
-`/v1/models` 里的列表是硬编码的。用 `probe_models.py` 逐个发真实请求来验证/更新：
+国内版 `/v1/models` 用硬编码列表，海外版实时同步上游 `/v3/config`。
+用 `probe_models.py` 逐个发真实请求来验证/更新：
 
 ```bash
 # 先启动 proxy，再探测

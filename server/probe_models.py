@@ -56,6 +56,11 @@ CANDIDATES: list[str] = [
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
     "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash", "o4-mini",
     "claude-opus-4.8",
+    "gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-sol",
+    "gemini-3.8-flash", "grok-4.7", "seedance-2.5", "step-5-preview",
+    "gpt-image-2.5-sunburst",
+    # 海外区域变体
+    "deepseek-v4.1-flash-sg",
     # 补全 / 编辑类
     "space-bunny", "space-bunny-limited-discount-202610",
     "codewise-default-model-v2", "codewise-completions",
