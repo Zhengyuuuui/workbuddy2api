@@ -56,6 +56,7 @@ workbuddy2api/
 │   ├── projection_metadata.py       # 压缩元数据
 │   ├── anthropic_adapter.py         # Anthropic API 转换
 │   ├── probe_models.py              # 实测探测上游可用模型
+│   ├── clean_logs.py                # 日志清理（默认 dry-run）
 │   ├── extract_device_token.py      # x-device-token 抓取
 │   └── test_*.py                    # 测试
 ├── pyproject.toml
@@ -505,6 +506,47 @@ tail -f logs/codebuddy-proxy.jsonl
 
 # 查看流式事件
 tail -100 logs/codebuddy-proxy.jsonl | jq 'select(.event | startswith("stream"))'
+```
+
+| 文件 | 内容 | 轮转 |
+|---|---|---|
+| `logs/proxy.log` | 滚动日志（启动信息、诊断） | 按天分片，保留 30 天 |
+| `logs/proxy.log.YYYY-MM-DD` | 历史分片 | 见下方清理脚本 |
+| `logs/codebuddy-proxy.jsonl` | CN 版请求日志（`--log-file` 默认值） | **无轮转** |
+| `logs/proxy-intl.jsonl` | 海外版请求日志 | **无轮转** |
+| `logs/*-start.log` | stdout 重定向 | 无 |
+
+> ⚠️ `.jsonl` 没有轮转，长时间运行会涨到几百 MB，需靠下面的脚本清理。
+>
+> ⚠️ `proxy.log.*` 分片的**文件名日期不可信** —— `TimedRotatingFileHandler`
+> 的 suffix 计算有 off-by-one，可能出现 `proxy.log.2026-10-05` 里装的却是
+> 10-20 的数据。判断新旧一律以 mtime 为准。
+
+### 清理日志
+
+```bash
+uv run server/clean_logs.py                    # 预览（默认，不做任何修改）
+uv run server/clean_logs.py --apply            # 执行
+uv run server/clean_logs.py --retain-days 14   # 保留两周
+uv run server/clean_logs.py --no-rotate        # 只删过期，不动大文件
+```
+
+清理策略：
+
+1. 删除修改时间早于 `--retain-days`（默认 7 天）的 `proxy.log.*` 分片
+2. 删除早于保留期、且未被运行中进程占用的 `*.jsonl`
+3. 对仍在写入但超过 `--max-size-mb`（默认 100MB）的活动 `*.jsonl`，
+   gzip 归档后截断
+
+安全约束：默认 dry-run；**任何正被写入的文件绝不删除**（判据是「被进程占用」
+或「最近 N 分钟改过」，proxy 每次写 jsonl 都会开关文件，所以 lsof 抓不到，
+必须靠 mtime）。
+
+定时清理（每天凌晨 4 点）：
+
+```bash
+crontab -e
+# 0 4 * * * cd /path/to/workbuddy2api && uv run server/clean_logs.py --apply >> logs/clean.log 2>&1
 ```
 
 ## 常见问题
