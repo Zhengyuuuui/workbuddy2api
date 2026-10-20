@@ -57,6 +57,7 @@ workbuddy2api/
 │   ├── anthropic_adapter.py         # Anthropic API 转换
 │   ├── probe_models.py              # 实测探测上游可用模型
 │   ├── clean_logs.py                # 日志清理（默认 dry-run）
+│   ├── install_clean_cron.sh        # 安装 launchd 定时清理
 │   ├── extract_device_token.py      # x-device-token 抓取
 │   └── test_*.py                    # 测试
 ├── pyproject.toml
@@ -542,12 +543,23 @@ uv run server/clean_logs.py --no-rotate        # 只删过期，不动大文件
 或「最近 N 分钟改过」，proxy 每次写 jsonl 都会开关文件，所以 lsof 抓不到，
 必须靠 mtime）。
 
-定时清理（每天凌晨 4 点）：
+#### 定时清理（macOS launchd）
 
 ```bash
-crontab -e
-# 0 4 * * * cd /path/to/workbuddy2api && uv run server/clean_logs.py --apply >> logs/clean.log 2>&1
+server/install_clean_cron.sh install     # 安装 + 立即触发一次验证
+server/install_clean_cron.sh status      # 查看状态与最近清理日志
+server/install_clean_cron.sh uninstall   # 卸载
 ```
+
+默认每天 04:00 执行 `clean_logs.py --apply --retain-days 7 --max-size-mb 100`，
+输出写到 `logs/clean.log`。脚本会按当前项目和用户名动态生成 plist，
+装在 `~/Library/LaunchAgents/`，登录时自动加载。
+
+> 用 launchd 而非 crontab：macOS 上 crontab 需要「完整磁盘访问」权限，且机器休眠会漏跑；
+> `StartCalendarInterval` 漏跑后开机能补一次。
+>
+> 想改频率/保留期就编辑 `server/install_clean_cron.sh` 顶部的 `HOUR` / `MINUTE` /
+> `RETAIN_DAYS` / `MAX_SIZE_MB`，重新 `install` 即可（会先卸载旧的）。
 
 ## 常见问题
 
