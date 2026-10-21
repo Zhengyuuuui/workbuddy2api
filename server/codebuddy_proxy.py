@@ -1307,7 +1307,18 @@ async def chat_completions(request: Request):
 async def create_response(request: Request):
     state = get_state()
     body = await request.json()
-    
+
+    # 调试：CODEBUDDY_DUMP_REQ=1 时把客户端原始请求体落盘，用于定位
+    # "Codex 走 responses 必失败 / 手动复现却成功" 这类请求体差异问题。
+    if os.getenv("CODEBUDDY_DUMP_REQ"):
+        try:
+            dump_dir = pathlib.Path("logs/req-dump")
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            (dump_dir / f"req-{int(time.time()*1000)}.json").write_text(
+                json.dumps(body, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:  # 落盘失败不能影响正常请求
+            diagnostic("req_dump_failed", error=str(exc))
+
     log_client_request("POST", "/v1/responses", body)
     
     # 转换 Responses → Chat
