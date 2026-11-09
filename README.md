@@ -196,7 +196,7 @@ model_provider = "codebuddy"
 
 ## 模型列表
 
-### 国内版 CodeBuddy（34 个，逐个实测可用）
+### 国内版 CodeBuddy（37 个，逐个实测可用）
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
@@ -207,6 +207,8 @@ model_provider = "codebuddy"
 | `deep-model` | Deep | codebuddy |
 | `hy4-preview` | Hy4 preview | tencent |
 | `hy4-preview-f` | Hy4 preview | tencent |
+| `hy4free` | Hy4 Free | tencent |
+| `hy4std` | Hy4 Standard | tencent |
 | `hy3` | Hy3 | tencent |
 | `hy3-x` | Hy3 | tencent |
 | `hunyuan-chat` | Hunyuan-Turbos | tencent |
@@ -218,6 +220,7 @@ model_provider = "codebuddy"
 | `glm-5v-turbo` | GLM-5v-Turbo | zhipu |
 | `kimi-k3` | Kimi-K3 | moonshot |
 | `kimi-k3-1` | Kimi-K3.1 | moonshot |
+| `kimi-k3.1-pro` | Kimi-K3.1-Pro | moonshot |
 | `kimi-k2.8-preview` | Kimi-K2.8-Preview | moonshot |
 | `kimi-k2.7` | Kimi-K2.7-Code | moonshot |
 | `kimi-k2.6` | Kimi-K2.6 | moonshot |
@@ -238,20 +241,26 @@ model_provider = "codebuddy"
 > `glm-5.1` 必须携带 `reasoning_effort`（proxy 会自动补 `medium`），
 > 否则上游返回 `code 11150`。它会先输出推理内容，`max_tokens` 过小可能只得到空回复。
 
-### 海外版 WorkBuddy AI（23 个，逐个实测可用）
+### 海外版 WorkBuddy AI（26 个，逐个实测可用）
 
 > 以下为 `personal_free_user` 免费账号实测可用的模型。
-> 免费账号下 GPT-5.6 / GPT-6 / GPT-5.5 / GPT-5.4 / Gemini / Grok / `primary-model`
-> 会被拒（`code 11158 not allowed for user type`）；`deep-model` 等已下线（`code 11102`）。
+> 免费账号下 GPT-5.6 / GPT-6 / GPT-5.5 / GPT-5.4 / Gemini / Grok /
+> `kimi-k3.1-pro` / `kimi-k3.1-pro-highspeed` / `primary-model` 会被拒
+> （`code 11158 not allowed for user type`）；`deep-model`、`step-5-preview`
+> 等已下线（`code 11102`）；`hy-image-3.5`、`kling-video-v3` 是图像/视频模型，
+> 不能走 chat（`code 11103`）。
 
 | 模型 ID | 显示名 | 厂商 |
 |---|---|---|
 | `default-model` | Auto | codebuddy |
 | `fast-model` | Fast | codebuddy |
 | `balanced-model` | Balanced | codebuddy |
+| `max-model` | Max | codebuddy |
 | `auto` | Auto | codebuddy |
 | `hy4-preview` | Hy4 preview | tencent |
 | `hy4-preview-f` | Hy4 preview | tencent |
+| `hy4free` | Hy4 Free | tencent |
+| `hy4std` | Hy4 Standard | tencent |
 | `hy3` | Hy3 | tencent |
 | `gpt-5.3-codex` | GPT-5.3-Codex | openai |
 | `glm-5.3` | GLM-5.3 | zhipu |
@@ -267,8 +276,8 @@ model_provider = "codebuddy"
 | `minimax-m3` | MiniMax-M3 | minimax |
 | `minimax-m3.1-flash` | MiniMax-M3.1-Flash | minimax |
 | `space-bunny` | Space-Bunny | tencent |
-| `step-5-preview` | Step-5-Preview | stepfun |
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
+| `deepseek-v4.1-flash-sg` | Deepseek-V4.1-Flash | deepseek |
 
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
 
@@ -303,6 +312,16 @@ uv run server/probe_models.py --port 8788           # 海外版（8788）
 uv run server/probe_models.py --extra "glm-9.9"     # 追加自定义候选
 uv run server/probe_models.py --from-config         # 顺便从云端配置收集候选
 ```
+
+> ⚠️ **探测要有耐心**。`onlyReasoning` 的模型（`kimi-k3.1-pro`、`hy4std`、
+> `glm-5.1` 等）会先花几分钟做推理，`max_tokens` 给小了只会拿到空 content
+> （HTTP 仍是 200）。实测 `hy4std` 单请求耗时 593s、2444 个 chunk。
+> 脚本默认 120s 超时，测这类模型要自行调大；顺序探测时还会被全局限速器
+> （1 QPS + 3s 抖动）串行化，几十个候选跑十几分钟是正常的。
+
+> ⚠️ **`/v3/config` 的 `models` 数组不是完整清单**。`kimi-k3.1-pro`、
+> `hy4free`、`hy4std` 只出现在 `agents[].models` 里，顶层 `models` 没有。
+> 用 `--from-config` 遍历所有嵌套字段才不会漏。
 
 输出会按可用/不可用分组，并标注上游错误码：
 

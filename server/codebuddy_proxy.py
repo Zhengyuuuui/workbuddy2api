@@ -1030,9 +1030,12 @@ async def list_models(refresh: int = 0):
             {"id": "default-model", "name": "Auto", "vendor": "codebuddy"},
             {"id": "fast-model", "name": "Fast", "vendor": "codebuddy"},
             {"id": "balanced-model", "name": "Balanced", "vendor": "codebuddy"},
+            {"id": "max-model", "name": "Max", "vendor": "codebuddy"},
             {"id": "auto", "name": "Auto", "vendor": "codebuddy"},
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy4-preview-f", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy4free", "name": "Hy4 Free", "vendor": "tencent"},
+            {"id": "hy4std", "name": "Hy4 Standard", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
             {"id": "gpt-5.3-codex", "name": "GPT-5.3-Codex", "vendor": "openai"},
             {"id": "glm-5.3", "name": "GLM-5.3", "vendor": "zhipu"},
@@ -1048,8 +1051,8 @@ async def list_models(refresh: int = 0):
             {"id": "minimax-m3", "name": "MiniMax-M3", "vendor": "minimax"},
             {"id": "minimax-m3.1-flash", "name": "MiniMax-M3.1-Flash", "vendor": "minimax"},
             {"id": "space-bunny", "name": "Space-Bunny", "vendor": "tencent"},
-            {"id": "step-5-preview", "name": "Step-5-Preview", "vendor": "stepfun"},
             {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
+            {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
             # --- 上游 /v3/config 快照，未在免费账号实测 ---
             {"id": "primary-model", "name": "Primary", "vendor": "codebuddy"},
             {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
@@ -1083,7 +1086,7 @@ async def list_models(refresh: int = 0):
         if live:
             models = live
     else:
-        # 国内 CodeBuddy 模型（逐个实测可用，共 34 个）
+        # 国内 CodeBuddy 模型（逐个实测可用，共 37 个）
         # 已移除：codewise-completions / codewise-default-model-v2（分别映射到已下线的
         #         completion-077 与 glm-4.7）、hunyuan-image-alpha（code 11103 后端不支持 chat）
         models = [
@@ -1094,6 +1097,8 @@ async def list_models(refresh: int = 0):
             {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
             {"id": "hy4-preview", "name": "Hy4 preview", "vendor": "tencent"},
             {"id": "hy4-preview-f", "name": "Hy4 preview", "vendor": "tencent"},
+            {"id": "hy4free", "name": "Hy4 Free", "vendor": "tencent"},
+            {"id": "hy4std", "name": "Hy4 Standard", "vendor": "tencent"},
             {"id": "hy3", "name": "Hy3", "vendor": "tencent"},
             {"id": "hy3-x", "name": "Hy3", "vendor": "tencent"},
             {"id": "hunyuan-chat", "name": "Hunyuan-Turbos", "vendor": "tencent"},
@@ -1105,6 +1110,7 @@ async def list_models(refresh: int = 0):
             {"id": "glm-5v-turbo", "name": "GLM-5v-Turbo", "vendor": "zhipu"},
             {"id": "kimi-k3", "name": "Kimi-K3", "vendor": "moonshot"},
             {"id": "kimi-k3-1", "name": "Kimi-K3.1", "vendor": "moonshot"},
+            {"id": "kimi-k3.1-pro", "name": "Kimi-K3.1-Pro", "vendor": "moonshot"},
             {"id": "kimi-k2.8-preview", "name": "Kimi-K2.8-Preview", "vendor": "moonshot"},
             {"id": "kimi-k2.7", "name": "Kimi-K2.7-Code", "vendor": "moonshot"},
             {"id": "kimi-k2.6", "name": "Kimi-K2.6", "vendor": "moonshot"},

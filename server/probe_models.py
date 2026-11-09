@@ -36,9 +36,9 @@ CANDIDATES: list[str] = [
     "auto", "default", "default-model", "fast-model", "balanced-model",
     "primary-model", "deep-model",
     # 腾讯混元
-    "hy4-preview", "hy4-preview-f", "hy3", "hy3-x",
-    "hy4-night-discount-daytime-badge-202609", "hy3-free-trial-202607",
-    "hunyuan-chat", "hunyuan-image-alpha",
+    "hy4-preview", "hy4-preview-f", "hy4free", "hy4std", "hy3", "hy3-x",
+    "hy4-free-trial-202611", "hy4-night-discount-daytime-badge-202609",
+    "hy3-free-trial-202607", "hunyuan-chat", "hunyuan-image-alpha",
     # 智谱 GLM
     "glm-5.3", "glm-5.3-flash", "glm-5.3-flashx", "glm-5.2", "glm-5.1",
     "glm-5v-turbo", "glm",
@@ -48,14 +48,15 @@ CANDIDATES: list[str] = [
     "deepseek-v4-pro-ioa", "deepseek-v4-pro-peak-202608",
     "deepseek-v4-flash-ioa", "deepseek-v4-flash-peak-202608",
     # Kimi
-    "kimi-k3", "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7",
-    "kimi-k2.6", "kimi-k2.5", "kimi",
+    "kimi-k3", "kimi-k3-1", "kimi-k3.1-pro", "kimi-k3.1-pro-highspeed",
+    "kimi-k3.2", "kimi-k4", "kimi-k2.8-preview", "kimi-k2.9",
+    "kimi-k2.7", "kimi-k2.6", "kimi-k2.5", "kimi",
     # MiniMax
     "minimax-m3", "minimax-m3.1-flash", "minimax-m2.7",
     # 小米 MiMo / 阶跃星辰 StepFun
     "mimo-v2.6-pro", "mimo-v2.6", "mimo-v2", "mimo-v1", "mimo-7b", "mimo-vl",
     "step-5-preview", "step-5", "step-3", "step-2", "step-r1", "step-1v",
-    "step-2-16k",
+    "step-2-16k", "step-5-preview-fire-trial-202610",
     # OpenAI / Google / Anthropic
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
     "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash", "o4-mini",
