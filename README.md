@@ -279,6 +279,11 @@ model_provider = "codebuddy"
 | `deepseek-v4.1-flash` | Deepseek-V4.1-Flash | deepseek |
 | `deepseek-v4.1-flash-sg` | Deepseek-V4.1-Flash | deepseek |
 
+> 上表只是**实测可用的 26 个**。代码里的海外快照还额外保留 11 个上游条目
+> （`primary-model`、`deep-model`、`gpt-5.6-terra/luna`、`gpt-6-sol/luna`、
+> `gpt-5.5`、`gpt-5.4`、`gemini-3.5/3.8-flash`、`grok-4.7`），付费账号下可能可用，
+> 免费账号调用会返回 `11158`。它们只在上游 `/v3/config` 拉不到时作为回退。
+
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
 
 #### 海外版 id 带 credits 倍率

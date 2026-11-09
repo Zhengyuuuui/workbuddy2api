@@ -1021,8 +1021,16 @@ async def list_models(refresh: int = 0):
     if overseas:
         # 海外 WorkBuddy AI 模型快照。仅作为上游 /v3/config 不可用时的回退，
         # 实时列表优先，见上方 _fetch_cloud_models。
-        # 标注 [实测] 的是逐个请求验证可用的；其余来自上游 /v3/config 快照，
-        # 在 personal_free_user 账号下多数不可用（11158 权限 / 11102 已下线）。
+        #
+        # 共 26 个 [实测]（personal_free_user 账号逐个请求验证可用）
+        # + 11 个上游快照（付费账号可能可用，免费账号会 11158）。
+        #
+        # 已确认不可用、不要加回来：
+        #   step-5-preview / deep-model            11102 已下线
+        #   gpt-image-2.5-sunburst / seedance-2.5   11103 图像视频模型，不能走 chat
+        #   kimi-k3.1-pro / -highspeed              11158 免费账号权限不足
+        #   hy-image-3.5 / kling-video-v3           11103 图像视频模型
+        #
         # ⚠️ /v3/config 实时列表会把 11158/11102 的模型也列出来（如 gpt-6-*、
         #    gemini-3.8-flash、grok-4.7、primary-model），客户端仍会选中后报错。
         models = [
@@ -1053,7 +1061,7 @@ async def list_models(refresh: int = 0):
             {"id": "space-bunny", "name": "Space-Bunny", "vendor": "tencent"},
             {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
             {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
-            # --- 上游 /v3/config 快照，未在免费账号实测 ---
+            # --- 上游 /v3/config 快照，未在免费账号实测（付费账号可能可用）---
             {"id": "primary-model", "name": "Primary", "vendor": "codebuddy"},
             {"id": "deep-model", "name": "Deep", "vendor": "codebuddy"},
             {"id": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "vendor": "openai"},
@@ -1062,13 +1070,9 @@ async def list_models(refresh: int = 0):
             {"id": "gpt-6-luna", "name": "GPT-6-Luna", "vendor": "openai"},
             {"id": "gpt-5.5", "name": "GPT-5.5", "vendor": "openai"},
             {"id": "gpt-5.4", "name": "GPT-5.4", "vendor": "openai"},
-            {"id": "gpt-image-2.5-sunburst", "name": "GPT-Image-2.5-Sunburst", "vendor": "openai"},
             {"id": "gemini-3.5-flash", "name": "Gemini-3.5-Flash", "vendor": "google"},
             {"id": "gemini-3.8-flash", "name": "Gemini-3.8-Flash", "vendor": "google"},
-            {"id": "deepseek-v4.1-flash-sg", "name": "Deepseek-V4.1-Flash", "vendor": "deepseek"},
             {"id": "grok-4.7", "name": "Grok-4.7", "vendor": "xai"},
-            {"id": "seedance-2.5", "name": "Seedance-2.5", "vendor": "bytedance"},
-            {"id": "step-5-preview", "name": "Step-5-Preview", "vendor": "stepfun"},
         ]
         # 实时优先：拉取上游 /v3/config（缓存 10 分钟），失败静默回退到快照
         now = time.time()
