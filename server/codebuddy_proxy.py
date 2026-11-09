@@ -1553,6 +1553,20 @@ async def forward_chat(
 # 异步流式转发（核心改进）
 # ============================================================================
 
+# 流式看门狗上限。上游偶尔会发出永不结束的 chunk 流（空 delta / 心跳 /
+# 卡住的 reasoning），而 httpx 的 read 超时是「两次读之间」的间隔，不是总时长，
+# 所以只要上游持续吐字节循环就永不退出。单 worker 的 uvicorn 事件循环会被
+# 这个协程占满，导致 /health 都无响应 —— 表现为「对话一半卡住」。
+STREAM_MAX_DURATION_S = 600.0      # 单条流总时长上限
+STREAM_MAX_CHUNKS = 20000          # 单条流 chunk 数上限
+STREAM_MAX_EMPTY_CHUNKS = 500      # 连续无内容 chunk 上限
+STREAM_MAX_BUFFERED_BYTES = 64 * 1024 * 1024   # 单条流累计行字节上限
+
+
+class StreamWatchdogError(Exception):
+    """流式看门狗触发：上游流无法正常结束。"""
+
+
 async def stream_upstream(
     url: str,
     headers: dict[str, str],
@@ -1601,6 +1615,8 @@ async def stream_upstream(
     raw_chunks: list[bytes] = []
     last_progress_log = stream_start_time
     detected_tool_calls = []
+    empty_chunk_streak = 0
+    buffered_bytes = 0
     try:
         # 异步HTTP客户端：timeout=None 依赖TCP超时
         # 使用合理的超时配置：连接超时30s，读取超时300s
@@ -1676,9 +1692,37 @@ async def stream_upstream(
                                 chunks=chunk_count,
                                 elapsed=round(now - stream_start_time, 2))
                             last_progress_log = now
-                    
+
+                    # 【看门狗】上游流永不结束时主动掐断，避免占满事件循环。
+                    # 只有 [DONE] 或 httpx 单次 read 超时能退出原循环，两者都拦不住
+                    # 「持续吐空 chunk」的上游。
+                    now = time.time()
+                    if now - stream_start_time > STREAM_MAX_DURATION_S:
+                        raise StreamWatchdogError(
+                            f"stream exceeded {STREAM_MAX_DURATION_S:.0f}s "
+                            f"after {chunk_count} chunks"
+                        )
+                    if chunk_count > STREAM_MAX_CHUNKS:
+                        raise StreamWatchdogError(
+                            f"stream exceeded {STREAM_MAX_CHUNKS} chunks"
+                        )
+                    if empty_chunk_streak > STREAM_MAX_EMPTY_CHUNKS:
+                        raise StreamWatchdogError(
+                            f"stream produced {empty_chunk_streak} consecutive "
+                            f"empty chunks after {chunk_count} chunks"
+                        )
+                    if buffered_bytes > STREAM_MAX_BUFFERED_BYTES:
+                        raise StreamWatchdogError(
+                            f"stream exceeded {STREAM_MAX_BUFFERED_BYTES // 1024 // 1024}MB "
+                            f"buffered after {chunk_count} chunks"
+                        )
+
                     line = line.strip()
-                    raw_chunks.append(line.encode("utf-8"))
+                    # raw_chunks 仅在 --verbose-llm 下才用得到，无条件累积会让
+                    # 长流白白吃掉几十 MB 内存。
+                    if state.verbose_llm:
+                        raw_chunks.append(line.encode("utf-8"))
+                    buffered_bytes += len(line)
                     
                     if not line.startswith("data:"):
                         continue
@@ -1694,6 +1738,11 @@ async def stream_upstream(
                         continue
                     
                     chunk_count += 1
+                    # 连续空 chunk 计数：有实际内容（或 usage 收尾帧）就归零
+                    has_payload = bool(
+                        ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content")
+                    ) or bool(chunk.get("usage"))
+                    empty_chunk_streak = 0 if has_payload else empty_chunk_streak + 1
                     rid = _extract_upstream_response_id(chunk)
                     if rid:
                         upstream_response_id = rid
@@ -1819,6 +1868,45 @@ async def stream_upstream(
 
             finally:
                 await resp.aclose()
+
+    except StreamWatchdogError as exc:
+        # 上游流无法正常结束：主动掐断。若已产出内容，按协议补发结束事件让客户端
+        # 正常收尾（内容截断但流程完整）；一帧都没有才回退到结构化错误。
+        diagnostic("stream_watchdog_tripped", protocol=protocol, chunks=chunk_count,
+            reason=str(exc), elapsed=round(time.time() - stream_start_time, 2))
+        state.write_log("stream_watchdog_tripped", protocol=protocol,
+            chunks=chunk_count, reason=str(exc))
+        state.breaker.note_5xx(state.client.endpoint, body.get("model", ""))
+
+        message = f"upstream stream stalled: {exc}"
+        if protocol == "responses" and responses_state and not finish_emitted:
+            if done_seen or getattr(responses_state, "started", False) or responses_state.text:
+                finish_emitted = True
+                try:
+                    for event_name, event_data in responses_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                except Exception as fin_exc:
+                    diagnostic("finish_reemit_error", protocol="responses", error=str(fin_exc))
+                return
+            err_event = {"type": "error", "error": {"type": "server_error", "message": message}}
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        elif protocol == "anthropic" and anthropic_state and not finish_emitted:
+            if done_seen or getattr(anthropic_state, "text", ""):
+                finish_emitted = True
+                try:
+                    for event_name, event_data in anthropic_state.finish():
+                        yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                except Exception as fin_exc:
+                    diagnostic("finish_reemit_error", protocol="anthropic", error=str(fin_exc))
+                return
+            err_event = {"type": "error", "error": {"type": "api_error", "message": message}}
+            yield f"event: error\ndata: {json.dumps(err_event, ensure_ascii=False)}\n\n".encode()
+        elif protocol == "openai":
+            if response_text:
+                yield b"data: [DONE]\n\n"
+            else:
+                error_chunk = {"error": {"message": message, "type": "upstream_error"}}
+                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n".encode()
 
     except httpx.TimeoutException as exc:
         # 【日志】超时
@@ -1961,6 +2049,7 @@ async def collect_upstream(
     frame_count = 0  # 实际收到的 data: 帧数（0 = 上游一帧都没给）
     # DSML 缓冲区
     dsml_buffer = DSMLStreamBuffer()
+    stream_start_time = time.time()
     
     try:
         # 使用合理的超时配置：连接超时30s，读取超时300s
@@ -2059,6 +2148,19 @@ async def collect_upstream(
                     }
 
                 async for line in resp.aiter_lines():
+                    # 【看门狗】与流式路径同理：上游永不结束时主动掐断，
+                    # 否则单 worker 的事件循环被占满，整个 proxy 无响应。
+                    now = time.time()
+                    if now - stream_start_time > STREAM_MAX_DURATION_S:
+                        raise StreamWatchdogError(
+                            f"stream exceeded {STREAM_MAX_DURATION_S:.0f}s "
+                            f"after {frame_count} frames"
+                        )
+                    if frame_count > STREAM_MAX_CHUNKS:
+                        raise StreamWatchdogError(
+                            f"stream exceeded {STREAM_MAX_CHUNKS} frames"
+                        )
+
                     line = line.strip()
                     if not line.startswith("data:"):
                         continue
@@ -2127,6 +2229,20 @@ async def collect_upstream(
 
             finally:
                 await resp.aclose()
+
+    except StreamWatchdogError as exc:
+        diagnostic("stream_watchdog_tripped", protocol=protocol, frames=frame_count,
+            reason=str(exc), elapsed=round(time.time() - stream_start_time, 2))
+        state.write_log("stream_watchdog_tripped", protocol=protocol,
+            frames=frame_count, reason=str(exc))
+        state.breaker.note_5xx(state.client.endpoint, body.get("model", ""))
+        raise HTTPException(
+            status_code=504,
+            detail={"error": {
+                "message": f"upstream stream stalled: {exc}",
+                "type": "timeout_error",
+            }},
+        )
 
     except httpx.HTTPError as exc:
         diagnostic("upstream_error", protocol=protocol, error=str(exc))
