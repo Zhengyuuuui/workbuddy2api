@@ -636,27 +636,45 @@ def _strip_http_framework_noise(request: httpx.Request, platform: str) -> httpx.
     return request
 
 
-def _delta_has_payload(chunk: dict[str, Any]) -> bool:
-    """判断一个上游 chunk 是否携带有效载荷。
+def _upstream_error_text(err: dict[str, Any]) -> str:
+    """从上游错误对象里提取可读文本（可能嵌在 message 的 JSON 字符串里）。"""
+    raw = err.get("message") or err.get("msg") or err.get("detail") or ""
+    text = str(raw)
+    # 上游常把 {"code":11155,"msg":"..."} 序列化后塞进 message
+    if text.startswith("{"):
+        try:
+            inner = json.loads(text)
+            if isinstance(inner, dict):
+                code = inner.get("code")
+                msg = inner.get("msg") or inner.get("message") or text
+                return f"upstream error {code}: {msg}" if code else str(msg)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return text or "upstream stream error"
 
-    有效载荷包括：
-      - delta.content            正文
-      - delta.reasoning_content  思考过程（reasoning_effort=high 时上游只流这个）
-      - delta.tool_calls         工具调用
-      - chunk.usage              收尾 usage 帧
 
-    只数 content 会把纯思考阶段误判成"上游卡死"。
+def _upstream_stream_error_frame(
+    err: dict[str, Any],
+    protocol: str,
+    responses_state: Any = None,
+    anthropic_state: Any = None,
+) -> bytes:
+    """把上游流内错误转成对应协议的错误帧。
+
+    必须按协议正确组帧：Responses/Anthropic 用 `event: error`，裸 `data:` 会
+    让客户端触发 422 格式转换错误；openai 用裸 data。
     """
-    if chunk.get("usage"):
-        return True
-    choices = chunk.get("choices") or []
-    if not choices:
-        return False
-    delta = choices[0].get("delta") or {}
-    for key in ("content", "reasoning_content", "reasoning", "tool_calls"):
-        if delta.get(key):
-            return True
-    return False
+    message = _upstream_error_text(err)
+    diagnostic("upstream_stream_error", protocol=protocol, message=message[:300])
+
+    if protocol == "responses":
+        event = {"type": "error", "error": {"type": "server_error", "message": message}}
+        return f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+    if protocol == "anthropic":
+        event = {"type": "error", "error": {"type": "api_error", "message": message}}
+        return f"event: error\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode()
+    payload = {"error": {"message": message, "type": "upstream_error"}}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
 def _extract_upstream_response_id(chunk: dict[str, Any]) -> str | None:
@@ -1586,18 +1604,22 @@ async def forward_chat(
 # 异步流式转发（核心改进）
 # ============================================================================
 
-# 流式看门狗上限。上游偶尔会发出永不结束的 chunk 流（空 delta / 心跳 /
-# 卡住的 reasoning），而 httpx 的 read 超时是「两次读之间」的间隔，不是总时长，
-# 所以只要上游持续吐字节循环就永不退出。单 worker 的 uvicorn 事件循环会被
-# 这个协程占满，导致 /health 都无响应 —— 表现为「对话一半卡住」。
-STREAM_MAX_DURATION_S = 600.0      # 单条流总时长上限
-STREAM_MAX_CHUNKS = 20000          # 单条流 chunk 数上限
-STREAM_MAX_EMPTY_CHUNKS = 500      # 连续无内容 chunk 上限
-STREAM_MAX_BUFFERED_BYTES = 64 * 1024 * 1024   # 单条流累计行字节上限
+# 流式防护上限。
+#
+# 设计参考 workbuddy2api-hub 的 upstream_timeouts()：header 超时管连接/TLS/首字节，
+# idle 超时管「每次读之间」，**故意不设总时长和 chunk 数上限**——数据在流就不杀，
+# 静默才杀。httpx 的 read=300s 正是「每次读之间」的语义，与 hub 的 idle 等价。
+#
+# 我们曾反过来做错过：加过 600s 总时长 + 500 连续空 chunk 上限，结果把
+# reasoning_effort=high 的长思考阶段（实测 500+ chunk 只流 reasoning_content）
+# 误判为上游卡死并掐断，直接造成「对话一半失败」。故这里只留资源护栏，
+# 不用来判断「流是否健康」。
+STREAM_MAX_BUFFERED_BYTES = 64 * 1024 * 1024   # 单条流累计行字节上限（内存护栏）
+STREAM_IDLE_READ_S = 300.0                     # 每次读之间的超时（= httpx read）
 
 
 class StreamWatchdogError(Exception):
-    """流式看门狗触发：上游流无法正常结束。"""
+    """流式防护触发：单条流占用资源超限。"""
 
 
 async def stream_upstream(
@@ -1648,7 +1670,6 @@ async def stream_upstream(
     raw_chunks: list[bytes] = []
     last_progress_log = stream_start_time
     detected_tool_calls = []
-    empty_chunk_streak = 0
     buffered_bytes = 0
     try:
         # 异步HTTP客户端：timeout=None 依赖TCP超时
@@ -1726,24 +1747,9 @@ async def stream_upstream(
                                 elapsed=round(now - stream_start_time, 2))
                             last_progress_log = now
 
-                    # 【看门狗】上游流永不结束时主动掐断，避免占满事件循环。
-                    # 只有 [DONE] 或 httpx 单次 read 超时能退出原循环，两者都拦不住
-                    # 「持续吐空 chunk」的上游。
-                    now = time.time()
-                    if now - stream_start_time > STREAM_MAX_DURATION_S:
-                        raise StreamWatchdogError(
-                            f"stream exceeded {STREAM_MAX_DURATION_S:.0f}s "
-                            f"after {chunk_count} chunks"
-                        )
-                    if chunk_count > STREAM_MAX_CHUNKS:
-                        raise StreamWatchdogError(
-                            f"stream exceeded {STREAM_MAX_CHUNKS} chunks"
-                        )
-                    if empty_chunk_streak > STREAM_MAX_EMPTY_CHUNKS:
-                        raise StreamWatchdogError(
-                            f"stream produced {empty_chunk_streak} consecutive "
-                            f"empty chunks after {chunk_count} chunks"
-                        )
+                    # 【资源护栏】只防内存失控，不用来判断流是否健康。
+                    # 上游只要持续吐字节就让它是健康的（hub 同策略：无总时长 /
+                    # 无 chunk 数上限）；真正静默时由 httpx read 超时兜底。
                     if buffered_bytes > STREAM_MAX_BUFFERED_BYTES:
                         raise StreamWatchdogError(
                             f"stream exceeded {STREAM_MAX_BUFFERED_BYTES // 1024 // 1024}MB "
@@ -1769,15 +1775,18 @@ async def stream_upstream(
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    
+
+                    # 上游可能在 SSE 流内（HTTP 200 之后）返回错误对象。
+                    # 不检查就会静默吞掉，客户端只看到一个空回复——线上
+                    # "对话一半卡住"的怀疑原因之一。
+                    if isinstance(chunk.get("error"), dict):
+                        done_seen = True
+                        yield _upstream_stream_error_frame(
+                            chunk["error"], protocol,
+                            responses_state, anthropic_state)
+                        return
+
                     chunk_count += 1
-                    # 连续空 chunk 计数：有实际内容（或 usage 收尾帧）就归零。
-                    # ⚠️ 必须把 reasoning_content 也算有效载荷：客户端发
-                    # reasoning_effort=high 时，上游会先只流思考过程
-                    # （实测难题 + 大上下文可达 500+ chunk 才出正文），
-                    # 只数 content 会把这些请求误判为"上游卡死"而掐断。
-                    has_payload = bool(_delta_has_payload(chunk))
-                    empty_chunk_streak = 0 if has_payload else empty_chunk_streak + 1
                     rid = _extract_upstream_response_id(chunk)
                     if rid:
                         upstream_response_id = rid
@@ -2079,6 +2088,7 @@ async def collect_upstream(
     usage = None
     finish_reason = None
     content = ""
+    reasoning_text = ""  # 累积的思考过程（reasoning_content）
     upstream_response_id: str | None = None
     tool_calls_dict: dict[int, dict] = {}  # 使用 dict 按 index 累加
     frame_count = 0  # 实际收到的 data: 帧数（0 = 上游一帧都没给）
@@ -2141,8 +2151,10 @@ async def collect_upstream(
                             }},
                         )
                     diagnostic("upstream_nonstream_body", protocol=protocol, content_type=ctype)
-                    content = ((parsed.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-                    tool_calls_raw = ((parsed.get("choices") or [{}])[0].get("message") or {}).get("tool_calls")
+                    _msg = (parsed.get("choices") or [{}])[0].get("message") or {}
+                    content = _msg.get("content") or ""
+                    reasoning_text = _msg.get("reasoning_content") or ""
+                    tool_calls_raw = _msg.get("tool_calls")
                     tool_calls = [
                         {
                             "id": tc.get("id", ""),
@@ -2176,6 +2188,7 @@ async def collect_upstream(
                                 "role": "assistant",
                                 "content": content,
                                 "tool_calls": tool_calls if tool_calls else None,
+                                **({"reasoning_content": reasoning_text} if reasoning_text else {}),
                             },
                             "finish_reason": finish_reason,
                         }],
@@ -2183,32 +2196,27 @@ async def collect_upstream(
                     }
 
                 async for line in resp.aiter_lines():
-                    # 【看门狗】与流式路径同理：上游永不结束时主动掐断，
-                    # 否则单 worker 的事件循环被占满，整个 proxy 无响应。
-                    now = time.time()
-                    if now - stream_start_time > STREAM_MAX_DURATION_S:
-                        raise StreamWatchdogError(
-                            f"stream exceeded {STREAM_MAX_DURATION_S:.0f}s "
-                            f"after {frame_count} frames"
-                        )
-                    if frame_count > STREAM_MAX_CHUNKS:
-                        raise StreamWatchdogError(
-                            f"stream exceeded {STREAM_MAX_CHUNKS} frames"
-                        )
-
                     line = line.strip()
                     if not line.startswith("data:"):
                         continue
-                    
+
                     data = line[5:].strip()
                     if data == "[DONE]":
                         break
-                    
+
                     try:
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    
+
+                    # 上游可能在流内返回错误对象（HTTP 200 之后）。
+                    # 不检查就静默吞掉，最终返回空响应。
+                    if isinstance(chunk.get("error"), dict):
+                        raise HTTPException(status_code=502, detail={"error": {
+                            "message": _upstream_error_text(chunk["error"]),
+                            "type": "upstream_error",
+                        }})
+
                     frame_count += 1
                     rid = _extract_upstream_response_id(chunk)
                     if rid:
@@ -2219,7 +2227,14 @@ async def collect_upstream(
                     for choice in chunk.get("choices") or []:
                         finish_reason = choice.get("finish_reason") or finish_reason
                         delta = choice.get("delta") or {}
-                        
+
+                        # 思考过程：累积下来随响应一起返回。非流式路径此前整体
+                        # 丢弃 reasoning_content，max_tokens 被推理吃满时客户端
+                        # 只能拿到空 content，无从判断发生了什么。
+                        reasoning = delta.get("reasoning_content")
+                        if isinstance(reasoning, str) and reasoning:
+                            reasoning_text += reasoning
+
                         # 处理 content（可能包含 DSML）
                         if delta.get("content"):
                             chunk_content = delta["content"]
@@ -2308,6 +2323,15 @@ async def collect_upstream(
         pass
     
     log_upstream_response(protocol, content, stream=False)
+    message: dict[str, Any] = {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls if tool_calls else None,
+    }
+    # 思考过程随响应返回。空 content 但有 reasoning 时（max_tokens 被推理吃满），
+    # 客户端至少能看到思考内容，而不是一个完全空的回复。
+    if reasoning_text:
+        message["reasoning_content"] = reasoning_text
     return {
         "id": "chatcmpl-" + uuid.uuid4().hex,
         "object": "chat.completion",
@@ -2318,11 +2342,7 @@ async def collect_upstream(
         "_upstream_frames": frame_count,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": content,
-                "tool_calls": tool_calls if tool_calls else None
-            },
+            "message": message,
             "finish_reason": finish_reason or "stop"
         }],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}

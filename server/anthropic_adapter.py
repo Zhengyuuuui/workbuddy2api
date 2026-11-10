@@ -191,7 +191,11 @@ def anthropic_request_to_chat(body: dict) -> dict:
         chat["tool_choice"] = _convert_tool_choice(tool_choice)
     
     # 透传参数
-    for key in ("max_tokens", "temperature", "top_p", "stop", "top_k"):
+    # reasoning_effort / thinking 必须带上：Anthropic 客户端（Claude Code 等）
+    # 发的思考强度参数如果在这里被丢掉，上游就不会进入思考模式，
+    # reasoning_content 全为空，客户端的思考配置静默失效。
+    for key in ("max_tokens", "temperature", "top_p", "stop", "top_k",
+                "reasoning_effort", "thinking"):
         if key in body:
             chat[key] = body[key]
     
@@ -281,7 +285,9 @@ class AnthropicStreamConverter:
         # 状态跟踪
         self.started = False
         self.text_block_index: int | None = None  # 当前text块的index
+        self.thinking_block_index: int | None = None  # 当前thinking块的index
         self.text = ""
+        self.thinking = ""  # 累积的思考过程（reasoning_content）
         self.tool_blocks: dict[int, dict] = {}  # Chat index -> {Anthropic index, id, name, arguments}
         self.next_anthropic_index = 0  # Anthropic content_block的index计数器
         self.finish_reason: str | None = None
@@ -317,14 +323,49 @@ class AnthropicStreamConverter:
         for choice in chunk.get("choices", []):
             self.finish_reason = choice.get("finish_reason") or self.finish_reason
             delta = choice.get("delta", {})
-            
+
+            # 思考过程（deepseek 风格 reasoning_content）→ 原生 thinking 块。
+            # 必须赶在正文之前：上游先流思考再流正文。此前这里整体丢弃思考内容，
+            # 用户为 reasoning token 付费却看不到任何输出。
+            reasoning = delta.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning:
+                self.thinking += reasoning
+
+                # 首次思考：关掉还未写内容的 text 块不可能发生（思考总在前），
+                # 直接打开 thinking 块。
+                if self.thinking_block_index is None:
+                    self.thinking_block_index = self.next_anthropic_index
+                    self.next_anthropic_index += 1
+                    self.open_blocks.add(self.thinking_block_index)
+                    events.append(("content_block_start", {
+                        "type": "content_block_start",
+                        "index": self.thinking_block_index,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }))
+
+                events.append(("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": self.thinking_block_index,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                }))
+
             # 文本内容
             if delta.get("content"):
                 text_delta = str(delta["content"])
                 self.text += text_delta
-                
-                # 首次文本：打开text块
+
+                # 首次文本：打开text块。
+                # Anthropic 要求块按顺序打开/关闭，所以若 thinking 块还开着，
+                # 必须先关掉它再开 text 块，否则客户端会报块交错错误。
                 if self.text_block_index is None:
+                    if self.thinking_block_index is not None and \
+                            self.thinking_block_index in self.open_blocks:
+                        events.append(("content_block_stop", {
+                            "type": "content_block_stop",
+                            "index": self.thinking_block_index,
+                        }))
+                        self.open_blocks.discard(self.thinking_block_index)
+
                     self.text_block_index = self.next_anthropic_index
                     self.next_anthropic_index += 1
                     self.open_blocks.add(self.text_block_index)

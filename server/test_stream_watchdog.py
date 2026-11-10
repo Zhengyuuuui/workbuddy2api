@@ -1,8 +1,13 @@
-"""流式看门狗测试：上游永不结束时必须主动掐断，不能占满事件循环。
+"""流式防护测试。
 
-背景：线上出现过一次上游对 2 字符 prompt 发出 1560+ 个空 chunk 且不给 [DONE]，
-httpx 的 read 超时是「两次读之间」的间隔，拦不住持续吐字节的上游，
-导致单 worker 的 uvicorn 事件循环被占满，/health 都无响应。
+设计（参考 workbuddy2api-hub 的 upstream_timeouts）：
+  - 不设总时长上限、不设 chunk 数上限、不设连续空 chunk 上限
+  - 数据在流就算健康；真正静默由 httpx read 超时（= idle）兜底
+  - 只保留累计缓冲字节上限作为内存护栏
+
+曾经做错的方向：加过 600s 总时长 + 500 连续空 chunk 上限，把
+reasoning_effort=high 的长思考阶段误判为上游卡死并掐断。这里的用例用于锁住
+「不再犯」。
 """
 
 import asyncio
@@ -12,15 +17,13 @@ import pytest
 
 import codebuddy_proxy as proxy
 from codebuddy_proxy import (
-    STREAM_MAX_CHUNKS,
-    STREAM_MAX_DURATION_S,
-    STREAM_MAX_EMPTY_CHUNKS,
+    STREAM_MAX_BUFFERED_BYTES,
     StreamWatchdogError,
 )
 
 
 class _FakeResponse:
-    """模拟一个永不结束的 SSE 响应。"""
+    """模拟一个 SSE 响应。"""
 
     def __init__(self, lines, status_code=200):
         self._lines = lines
@@ -39,8 +42,38 @@ class _FakeResponse:
         self.closed = True
 
 
-def _endless_empty_chunks(n):
-    """n 个空 delta chunk（没有 content，也没有 [DONE]）。"""
+def _content_chunks(n, text="x"):
+    return [
+        'data: ' + json.dumps({
+            "id": "cmb-test", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+        })
+        for _ in range(n)
+    ]
+
+
+def _reasoning_chunks(n, with_final_content=True):
+    """模拟 reasoning_effort=high：先只流 reasoning_content，再给正文。"""
+    lines = [
+        'data: ' + json.dumps({
+            "id": "cmb-test", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {
+                "reasoning_content": f"思考{i}...", "content": "",
+            }, "finish_reason": None}],
+        })
+        for i in range(n)
+    ]
+    if with_final_content:
+        lines.append('data: ' + json.dumps({
+            "id": "cmb-test", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "最终答案"},
+                         "finish_reason": None}],
+        }))
+    lines.append("data: [DONE]")
+    return lines
+
+
+def _empty_chunks(n):
     return [
         'data: ' + json.dumps({
             "id": "cmb-test", "object": "chat.completion.chunk",
@@ -51,8 +84,7 @@ def _endless_empty_chunks(n):
 
 
 @pytest.fixture
-def patched(monkeypatch, tmp_path):
-    """把 httpx 客户端和全局 state 换成假的，隔离测试。"""
+def patched(monkeypatch):
     import httpx
 
     class _FakeClient:
@@ -74,7 +106,6 @@ def patched(monkeypatch, tmp_path):
             return _FakeClient.sent["response"]
 
     monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
-    # 绕过认证与限速
     monkeypatch.setattr(proxy, "get_state", lambda: _FakeState())
     return _FakeClient
 
@@ -132,206 +163,130 @@ async def _drain(agen):
     return out
 
 
-def test_endless_empty_chunks_trips_watchdog(patched):
-    """上游发远超上限的空 chunk：流必须在有限时间内终止，不能挂起。
-
-    注意：看门狗异常会被 stream_upstream 捕获后按协议转成结构化错误帧发给
-    客户端（而非向上抛），所以这里断言「会结束」+「有错误帧」。
-    """
-    patched.sent["response"] = _FakeResponse(
-        _endless_empty_chunks(STREAM_MAX_EMPTY_CHUNKS + 50)
-    )
-
-    async def run():
-        agen = proxy.stream_upstream(
-            "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "hy3", "messages": []}, "openai", None,
-        )
-        return await _drain(agen)
-
-    # 关键：wait_for 超时即视为「挂起未修复」
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
-    joined = b"".join(chunks)
-    assert b"stalled" in joined
-    assert b"[DONE]" not in joined
-
-
-def test_chunk_cap_trips_watchdog(patched):
-    """即使每个 chunk 都带内容（避开空 chunk 检测），chunk 数上限也要生效。
-
-    已有内容时看门狗按设计优雅收尾（补发 [DONE]）而非报错，所以这里只断言
-    「流会在有限时间内结束」——这正是修复挂起的关键性质。
-    """
-    lines = [
-        'data: ' + json.dumps({
-            "id": "cmb-test", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}],
-        })
-        for _ in range(STREAM_MAX_CHUNKS + 50)
-    ]
+def _run(patched, lines, protocol="openai", body=None):
     patched.sent["response"] = _FakeResponse(lines)
 
-    async def run():
+    async def go():
         agen = proxy.stream_upstream(
             "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "hy3", "messages": []}, "openai", None,
+            {}, body or {"model": "deepseek-v4.1-flash", "messages": []},
+            protocol, None,
         )
         return await _drain(agen)
 
-    # wait_for 超时即视为「仍然挂起」
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=120))
+    return asyncio.run(asyncio.wait_for(go(), timeout=60))
+
+
+# ---------------------------------------------------------------------------
+# 回归：长思考阶段不能被掐断
+# ---------------------------------------------------------------------------
+
+def test_very_long_reasoning_phase_not_killed(patched):
+    """远超旧阈值（500）的纯 reasoning 阶段必须放行。"""
+    chunks = _run(patched, _reasoning_chunks(3000),
+                  body={"model": "deepseek-v4.1-flash", "messages": [],
+                        "reasoning_effort": "high"})
     joined = b"".join(chunks)
-    # 不应吐出全部 20050 帧（说明确实被掐断了）
-    assert joined.count(b"chat.completion.chunk") < STREAM_MAX_CHUNKS + 50
-    assert joined.count(b"chat.completion.chunk") <= STREAM_MAX_CHUNKS + 1
+    assert b"stalled" not in joined
+    assert b"[DONE]" in joined
 
 
-def test_duration_cap_trips_watchdog(patched, monkeypatch):
-    """总时长上限生效：伪造一个比上限更久的流。"""
-    monkeypatch.setattr(proxy, "STREAM_MAX_DURATION_S", 0.0)
-    lines = [
-        'data: ' + json.dumps({
-            "id": "cmb-test", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "x"}, "finish_reason": None}],
-        }),
-        "data: [DONE]",
-    ]
-    patched.sent["response"] = _FakeResponse(lines)
-
-    async def run():
-        agen = proxy.stream_upstream(
-            "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "hy3", "messages": []}, "openai", None,
-        )
-        return await _drain(agen)
-
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
+def test_long_content_stream_not_killed(patched):
+    """长正文流（远超旧的 20000 chunk 上限）必须放行。"""
+    chunks = _run(patched, _content_chunks(30000))
     joined = b"".join(chunks)
-    # 第一帧都没处理就被掐断，无内容可优雅收尾，只能给错误帧
-    assert joined.count(b"chat.completion.chunk") == 0
-    assert b"stalled" in joined
-    assert b"[DONE]" not in joined
+    assert b"stalled" not in joined
+    assert b"[DONE]" in joined
+
+
+def test_long_empty_stream_not_killed(patched):
+    """持续空 chunk 也不杀——数据在流即健康，真正静默由 idle 超时兜底。"""
+    chunks = _run(patched, _empty_chunks(5000))
+    joined = b"".join(chunks)
+    assert b"stalled" not in joined
+    assert b"[DONE]" in joined
 
 
 def test_normal_stream_completes(patched):
-    """正常流（有内容 + [DONE]）不能被看门狗误杀。"""
-    lines = [
-        'data: ' + json.dumps({
-            "id": "cmb-test", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": None}],
-        }),
-        "data: [DONE]",
-    ]
-    patched.sent["response"] = _FakeResponse(lines)
-
-    async def run():
-        agen = proxy.stream_upstream(
-            "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "hy3", "messages": []}, "openai", None,
-        )
-        return await _drain(agen)
-
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
-    joined = b"".join(chunks)
-    assert b"[DONE]" in joined
+    lines = _content_chunks(3, "hi") + ["data: [DONE]"]
+    joined = b"".join(_run(patched, lines))
     assert b"hi" in joined
-
-
-def test_empty_chunk_streak_resets_on_content(patched):
-    """空 chunk 后接有内容 chunk，计数应归零，不触发看门狗。"""
-    lines = _endless_empty_chunks(STREAM_MAX_EMPTY_CHUNKS - 5)
-    lines += [
-        'data: ' + json.dumps({
-            "id": "cmb-test", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}],
-        }),
-        "data: [DONE]",
-    ]
-    patched.sent["response"] = _FakeResponse(lines)
-
-    async def run():
-        agen = proxy.stream_upstream(
-            "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "hy3", "messages": []}, "openai", None,
-        )
-        return await _drain(agen)
-
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
-    assert b"[DONE]" in b"".join(chunks)
-
-
-def _reasoning_chunks(n, with_final_content=True):
-    """模拟 reasoning_effort=high 的上游：先只流 reasoning_content，再给正文。"""
-    lines = [
-        'data: ' + json.dumps({
-            "id": "cmb-test", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {
-                "reasoning_content": f"思考{i}...", "content": "",
-            }, "finish_reason": None}],
-        })
-        for i in range(n)
-    ]
-    if with_final_content:
-        lines.append('data: ' + json.dumps({
-            "id": "cmb-test", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": {"content": "最终答案"},
-                         "finish_reason": None}],
-        }))
-    lines.append("data: [DONE]")
-    return lines
-
-
-def test_long_reasoning_phase_not_treated_as_stall(patched):
-    """回归：reasoning_effort=high 时上游先只流 reasoning_content。
-
-    实测 reasoning 阶段可达 500+ chunk，只数 content 会把请求误判为上游卡死。
-    此前这条路径被看门狗掐断，用户侧表现为「对话一半卡住/失败」。
-    """
-    patched.sent["response"] = _FakeResponse(
-        _reasoning_chunks(STREAM_MAX_EMPTY_CHUNKS + 200)
-    )
-
-    async def run():
-        agen = proxy.stream_upstream(
-            "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "deepseek-v4.1-flash", "messages": [],
-                 "reasoning_effort": "high"}, "openai", None,
-        )
-        return await _drain(agen)
-
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=60))
-    joined = b"".join(chunks)
-    assert b"stalled" not in joined, "长思考阶段被误判为上游卡死"
     assert b"[DONE]" in joined
 
 
-def test_delta_has_payload_counts_reasoning():
-    """_delta_has_payload 必须把 reasoning_content 视为有效载荷。"""
-    from codebuddy_proxy import _delta_has_payload
+# ---------------------------------------------------------------------------
+# 新增：流内 error 必须被识别并上报，不能静默吞掉
+# ---------------------------------------------------------------------------
 
-    assert _delta_has_payload({"choices": [{"delta": {"content": "x"}}]})
-    assert _delta_has_payload({"choices": [{"delta": {"reasoning_content": "想"}}]})
-    assert _delta_has_payload({"choices": [{"delta": {"reasoning": "想"}}]})
-    assert _delta_has_payload({"choices": [{"delta": {"tool_calls": [{"id": "1"}]}}]})
-    assert _delta_has_payload({"usage": {"total_tokens": 1}})
-    assert not _delta_has_payload({"choices": [{"delta": {"content": ""}}]})
-    assert not _delta_has_payload({"choices": [{"delta": {}}]})
-    assert not _delta_has_payload({"choices": []})
-    assert not _delta_has_payload({})
+def test_in_stream_error_is_surfaced_openai(patched):
+    """上游在 SSE 流内返回错误对象时，必须转成错误帧而不是空回复。"""
+    lines = [
+        'data: ' + json.dumps({
+            "id": "cmb-test", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "PARTIAL"},
+                         "finish_reason": None}],
+        }),
+        'data: ' + json.dumps({
+            "error": {"message": '{"code":11155,"msg":"the reasoning content from '
+                                 'the previous turn must be passed back in thinking mode"}',
+                      "type": "invalid_request_error"}
+        }),
+        "data: [DONE]",
+    ]
+    joined = b"".join(_run(patched, lines))
+    assert b"11155" in joined
+    assert b"reasoning content" in joined
+    assert b"PARTIAL" in joined
 
 
-def test_truly_empty_stream_still_trips(patched):
-    """真正全空的流（无 content 也无 reasoning）仍必须被看门狗掐断。"""
-    patched.sent["response"] = _FakeResponse(
-        _endless_empty_chunks(STREAM_MAX_EMPTY_CHUNKS + 50)
-    )
+def test_in_stream_error_anthropic_uses_event_frame(patched):
+    """Anthropic 协议必须用 `event: error` 帧，裸 data: 会让客户端 422。"""
+    lines = [
+        'data: ' + json.dumps({"error": {"message": "upstream said no"}}),
+    ]
+    joined = b"".join(_run(patched, lines, protocol="anthropic"))
+    assert joined.startswith(b"event: error\n")
+    assert b"upstream said no" in joined
 
-    async def run():
-        agen = proxy.stream_upstream(
-            "https://copilot.tencent.com/v2/chat/completions",
-            {}, {"model": "hy3", "messages": []}, "openai", None,
-        )
-        return await _drain(agen)
 
-    chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
-    assert b"stalled" in b"".join(chunks)
+def test_in_stream_error_responses_uses_event_frame(patched):
+    lines = [
+        'data: ' + json.dumps({"error": {"message": "upstream said no"}}),
+    ]
+    joined = b"".join(_run(patched, lines, protocol="responses"))
+    assert joined.startswith(b"event: error\n")
+    assert b"upstream said no" in joined
+
+
+def test_in_stream_error_plain_message(patched):
+    """message 不是 JSON 字符串时也要能提取。"""
+    lines = ['data: ' + json.dumps({"error": {"message": "simple failure"}})]
+    joined = b"".join(_run(patched, lines))
+    assert b"simple failure" in joined
+
+
+# ---------------------------------------------------------------------------
+# 内存护栏仍然生效
+# ---------------------------------------------------------------------------
+
+def test_buffered_bytes_guard_still_trips(patched, monkeypatch):
+    """累计缓冲超限仍要掐断——这是资源保护，不影响正确性。
+
+    注意：已有部分内容时按设计优雅收尾（补发 [DONE]）而非报错帧，
+    所以断言「提前终止」而不是断言错误文本。
+    """
+    monkeypatch.setattr(proxy, "STREAM_MAX_BUFFERED_BYTES", 1024)
+    # 每行约 136 字节，100 行共 13612 字节
+    lines = _content_chunks(100) + ["data: [DONE]"]
+    out = _run(patched, lines)
+    joined = b"".join(out)
+    # 必须远早于 100 帧就停
+    assert joined.count(b"chat.completion.chunk") < 20
+    assert b"[DONE]" in joined
+
+
+def test_buffered_bytes_guard_allows_normal_stream(patched):
+    """正常流不能撞到内存护栏。"""
+    joined = b"".join(_run(patched, _content_chunks(50) + ["data: [DONE]"]))
+    assert joined.count(b"chat.completion.chunk") == 50
+    assert b"[DONE]" in joined
