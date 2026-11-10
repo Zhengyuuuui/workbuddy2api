@@ -1,6 +1,6 @@
 """流式防护测试。
 
-设计（参考 workbuddy2api-hub 的 upstream_timeouts）：
+设计：
   - 不设总时长上限、不设 chunk 数上限、不设连续空 chunk 上限
   - 数据在流就算健康；真正静默由 httpx read 超时（= idle）兜底
   - 只保留累计缓冲字节上限作为内存护栏

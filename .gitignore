@@ -61,5 +61,5 @@ about-me.md
 self-introduction.md
 *device-token*.json
 
-# 外部项目横评笔记（含未公开分析，不上 remote）
-doc/HUB-BENCHMARK.md
+# 内部设计笔记（不上 remote）
+doc/STREAM-HARDENING-NOTES.md

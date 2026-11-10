@@ -1581,7 +1581,7 @@ async def forward_chat(
     else:
         # 非流式：聚合后返回。上游瞬时拒绝（HTTP 200 但一帧都没给）时换模型重试一次，
         # 复用同一份会话/trace 身份——换号重试若换会话 ID，上游看到的是
-        # 多个并发会话而非一次对话的一次重试（外部项目逆向结论）。
+        # 多个并发会话而非一次对话的一次重试。
         for attempt in range(2):
             collected = await collect_upstream(url, headers, upstream_body, protocol)
             frames = int(collected.pop("_upstream_frames", 0) or 0)
@@ -1606,9 +1606,9 @@ async def forward_chat(
 
 # 流式防护上限。
 #
-# 设计参考 workbuddy2api-hub 的 upstream_timeouts()：header 超时管连接/TLS/首字节，
-# idle 超时管「每次读之间」，**故意不设总时长和 chunk 数上限**——数据在流就不杀，
-# 静默才杀。httpx 的 read=300s 正是「每次读之间」的语义，与 hub 的 idle 等价。
+# 超时策略：header 超时管连接/TLS/首字节，idle 超时管「每次读之间」，
+# **故意不设总时长和 chunk 数上限**——数据在流就不杀，静默才杀。
+# httpx 的 read=300s 正是「每次读之间」的语义，即 idle 超时。
 #
 # 我们曾反过来做错过：加过 600s 总时长 + 500 连续空 chunk 上限，结果把
 # reasoning_effort=high 的长思考阶段（实测 500+ chunk 只流 reasoning_content）
@@ -1748,8 +1748,8 @@ async def stream_upstream(
                             last_progress_log = now
 
                     # 【资源护栏】只防内存失控，不用来判断流是否健康。
-                    # 上游只要持续吐字节就让它是健康的（hub 同策略：无总时长 /
-                    # 无 chunk 数上限）；真正静默时由 httpx read 超时兜底。
+                    # 上游只要持续吐字节就算健康（无总时长 / 无 chunk 数上限）；
+                    # 真正静默时由 httpx read 超时兜底。
                     if buffered_bytes > STREAM_MAX_BUFFERED_BYTES:
                         raise StreamWatchdogError(
                             f"stream exceeded {STREAM_MAX_BUFFERED_BYTES // 1024 // 1024}MB "

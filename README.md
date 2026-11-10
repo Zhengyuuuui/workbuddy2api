@@ -626,6 +626,50 @@ API returned an empty or malformed response (HTTP 200) — body is an event stre
 
 回归测试：`server/test_nonstream_hardening.py`。
 
+### 流式转发的健康判定
+
+proxy 对「什么是健康的流」只有一条判据：**数据在流就算健康，静默才杀。**
+
+```
+header 超时   连接 / TLS / 首字节        120s
+idle 超时     每次读之间的间隔           300s（= httpx read）
+总时长上限    没有
+chunk 数上限  没有
+连续空 chunk   没有
+```
+
+**为什么不设总时长 / chunk 数 / 连续空 chunk 上限**：推理模型
+（`reasoning_effort=high`）会先只流 `delta.reasoning_content`，实测难题 +
+大上下文下这个阶段可达 500+ chunk，之后才出正文；长正文流也可能几万个 chunk。
+任何基于「连续多少 chunk 没有 content」或「总共多少 chunk」的判断都会把
+正常请求误杀。唯一保留的是**累计缓冲字节上限（64MB）**——那是内存资源保护，
+与流是否健康无关。
+
+### 上游错误不会静默吞掉
+
+上游可能在 HTTP 200 **之后**的 SSE 流里返回错误对象。proxy 解析出 `error`
+字典就立刻按协议转成错误帧并终止，而不是继续循环最后交出一个空回复：
+
+- Responses / Anthropic → `event: error` 帧（裸 `data:` 会让客户端触发 422）
+- OpenAI → 裸 `data:` 错误 chunk
+
+上游常把 `{"code":11155,"msg":"..."}` 序列化后塞进 `message` 字段，
+proxy 会解出内层 code 和 msg 再上报。
+
+### 思考过程（reasoning_content）会转发
+
+| 路径 | 处理 |
+|---|---|
+| OpenAI 流式 | 透传（只覆盖 `delta.content`，不动其他字段） |
+| Anthropic 流式 | 转成原生 `thinking` 块，含块顺序处理 |
+| 非流式 | 随 `message.reasoning_content` 返回 |
+
+ Anthropic 的 content block 必须按顺序打开/关闭，不能交错，所以开 text 块前
+会先关掉还开着的 thinking 块。
+
+> `max_tokens` 给小了可能出现「推理吃满配额、正文为空」（`finish_reason=length`、
+> `content=""`）。这是上游行为，此时 `reasoning_content` 里能看到思考内容。
+
 ## 技术细节
 
 - **架构**: FastAPI + httpx（异步）

@@ -301,8 +301,8 @@ class TestIntlOfficialHeaderParity:
     def test_trace_headers_same_origin(self, captured):
         """OPtel 头必须同源：traceparent/b3/X-Trace-ID/X-B3-TraceId/X-Root-Request-ID。
 
-        逆向结论（xiaofan6ya §10.9）：同一请求里出现两个不同 traceId 是自相矛盾的
-        特征，比不发更糟。本断言为纯本地内存校验，不发起任何网络请求。
+        逆向结论：同一请求里出现两个不同 traceId 是自相矛盾的特征，比不发更糟。
+        本断言为纯本地内存校验，不发起任何网络请求。
         """
         self._post_intl()
         headers = captured[0]["headers"]

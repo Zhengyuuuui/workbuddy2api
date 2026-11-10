@@ -178,25 +178,24 @@ def response(flow: http.HTTPFlow) -> None:
 - `~/.workbuddy-ai/system-ca-bundle.pem`（mitm CA）**已删除**
 - 两个 bridge：8787（国内，uptime 连续未动）/ 8788（国际，伪装头新版）
 
-## 八、外部项目交叉验证（2026-09-25，ardeyouxipianyi/workbuddy2api-hub + xiaofan6ya/workbuddy2api）
+## 八、独立逆向结论交叉验证（2026-09-25）
 
-两家独立项目的逆向结论与本仓库互相印证：
+两份独立来源的逆向结论与本仓库互相印证：
 
-- **xiaofan6ya §10.9.1**：Turing SDK 对 HTTP 只暴露 `X-Device-Token`／
-  `X-Device-Token-Error` 两个互斥头，无任何 `X-Turing-*` 签名头，token 是
-  原生 DLL 采集硬件指纹后换取的**不透明字符串**，纯 Python 无法复刻；官方
-  客户端自带"未配置就降级"路径，**不发该头不算异常**
-- 其 §10.9 与我们一样用**反向断言测试**锁死官方头型
-  （`test_client_header_shape_matches_official`），并强调 traceparent/b3/
+- **Turing SDK 对 HTTP 只暴露 `X-Device-Token`／`X-Device-Token-Error`
+  两个互斥头**，无任何 `X-Turing-*` 签名头；token 是原生 DLL 采集硬件指纹后
+  换取的**不透明字符串**，纯 Python 无法复刻。官方客户端自带"未配置就降级"
+  路径，**不发该头不算异常**
+- 另一来源同样用**反向断言测试**锁死官方头型，并强调 traceparent/b3/
   X-Trace-ID **必须同源**，"发得不一致比不发更糟"——已落地为
   `TestIntlOfficialHeaderParity::test_trace_headers_same_origin`
-- **hub v1.5.0** 修正记录：官方是 `X-Product: SaaS`（自创值会被识别），与
-  我们 t006 抓包一致；hub 另确认 `www.codebuddy.ai` 无法解析、国际版 CLI
-  身份也只能走 `www.workbuddy.ai`
-- 两家都**刻意不做跨区域同名模型混合轮询**（指纹对齐 + 防关联考量），与
-  本仓库双 bridge 物理隔离一致
-- 注意：他们的 `X-Private-Data:false` / `Accept-Language:zh-CN` 是**国内
-  5.5.6 CLI 身份**观测，与本国际版抓包不同，**不照抄**
+- 官方是 `X-Product: SaaS`（自创值会被识别），与本仓库 t006 抓包一致；
+  另确认 `www.codebuddy.ai` 无法解析，国际版 CLI 身份也只能走
+  `www.workbuddy.ai`
+- 两份来源都**刻意不做跨区域同名模型混合轮询**（指纹对齐 + 防关联考量），
+  与本仓库双 bridge 物理隔离一致
+- 注意：`X-Private-Data:false` / `Accept-Language:zh-CN` 是**国内 5.5.6 CLI
+  身份**观测，与本国际版抓包不同，**不照抄**
 
 ## 九、生产事故记录：httpx `send()` 不是上下文管理器（2026-09-25）
 
