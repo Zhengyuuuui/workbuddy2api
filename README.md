@@ -387,9 +387,9 @@ for m in cfg.get('models') or []: print(' ', m.get('id'), '|', m.get('name'))
                            获取方式见 doc/mitm-capture-playbook.md §7。
                            海外版客户端不产 x-device-token，此参数对
                            workbuddy-ai 平台无效）
---rate-qps FLOAT         全局限速：持续 QPS（默认 1.0，0 不限速）
---rate-burst INT         全局限速：突发容量（默认 5，超出排队）
---rate-jitter FLOAT      每请求随机抖动上限（秒，默认 3.0，0 关闭）
+--rate-qps FLOAT         全局限速：持续 QPS（默认 3.0，0 不限速）
+--rate-burst INT         全局限速：突发容量（默认 10，超出排队）
+--rate-jitter FLOAT      每请求随机抖动上限（秒，默认 0.5，0 关闭）
 --credit-burn-threshold  消耗速率告警阈值（默认 0.3 = 窗口消耗占剩余额度 30%）
 ```
 
@@ -584,6 +584,45 @@ server/install_clean_cron.sh uninstall   # 卸载
 >
 > 想改频率/保留期就编辑 `server/install_clean_cron.sh` 顶部的 `HOUR` / `MINUTE` /
 > `RETAIN_DAYS` / `MAX_SIZE_MB`，重新 `install` 即可（会先卸载旧的）。
+
+### 防护策略与阈值
+
+proxy 有三层防护，都遵循同一个原则：**只在确有异常时介入，不打扰正常使用**。
+
+| 防护 | 默认值 | 触发条件 | 动作 |
+|---|---|---|---|
+| 全局限速 | 3 QPS / 突发 10 / 抖动 0.5s | 令牌桶耗尽 | 排队等待，不拒绝 |
+| 熔断器 | 连续 8 次 5xx / 冷却 60s | 上游连续 5xx | 快速失败 429 |
+| 429 熔断 | 按上游 reset 时间（默认 300s） | 上游返回 429/6004 | 快速失败 429 |
+| 消耗告警 | 1,000,000 tokens / 10min | 窗口消耗超阈值 | **只记日志，不拒绝** |
+
+#### 阈值是怎么定的
+
+**限速 3 QPS + 0.5s 抖动**：最初是 1 QPS + 3s 抖动，来自一次封禁事件后的保守配置。
+但 3s 抖动加在**每一个**请求上，交互式编码场景下每次都要等 0~3 秒，体感就是"网关很慢"。
+现在维持限速（避免打爆上游）但把常驻延迟降到可接受范围。
+
+**熔断 8 次 5xx / 60s**：最初是 5 次 / 120s。5xx 更可能是上游瞬时抖动而非封控，
+连错 5 次就把用户挡在门外 2 分钟，反馈是"用一会儿就被网关拦"。
+真正的封控信号是 429/6004，那条路径本来就会按上游返回的 reset 时间冷却，不受此影响。
+
+**消耗告警 1,000,000 tokens / 10min**：这里曾有一个**单位 bug** ——
+阈值用 `credits_remain × 0.3` 算，窗口却累加 `tokens`，两个单位直接比较。
+国内版计费接口返回 403（`code 10085`）拿不到 credits，于是走兜底值 500，
+而 500 是 **token 数**：一次真实请求（大 system prompt + 代码上下文）轻松上万 token，
+结果一两个请求就报 `credit_burn_warning`。现在：
+
+- 上游 usage 带 `credit` 字段且能拿到 `credits_remain` 时 → **credits 比 credits**
+- 否则 → **tokens 比 tokens**，兜底阈值 1,000,000 tokens/10min
+
+按 AI 编码会话估算：单次请求 1~5 万 token，10 分钟内几十次请求约几十万 token，
+1,000,000 之上才算异常（死循环重试、忘记截断的上下文）。
+
+> 告警**只写日志、不拒绝请求**，不影响使用。看日志：
+> ```bash
+> grep credit_burn_warning logs/proxy.log
+> curl -s 'http://127.0.0.1:8787/v1/credits' | jq '.burn_warning, .local'
+> ```
 
 ## 常见问题
 

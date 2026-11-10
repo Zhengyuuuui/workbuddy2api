@@ -100,27 +100,33 @@ class TestBreakerUnit:
         assert b.check("https://ep-a", "m2")[0] is False
         assert b.check("https://ep-b", "m1")[0] is False
 
-    def test_five_consecutive_5xx_trips_120s(self):
+    def test_consecutive_5xx_trips_after_threshold(self):
+        """连续 8 次 5xx 才熔断、冷却 60s。
+
+        曾经是 5 次 / 120s：上游偶发抖动就把用户挡在门外 2 分钟，
+        反馈「用一会儿就被网关拦」。5xx 更可能是瞬时抖动，封控信号是
+        429/6004（那条路径按上游 reset 时间冷却）。
+        """
         b = UpstreamCircuitBreaker()
-        for i in range(4):
+        for i in range(7):
             assert b.note_5xx("https://ep", "m1") == (False, 0.0)
             assert b.check("https://ep", "m1")[0] is False
         tripped, duration = b.note_5xx("https://ep", "m1")
         assert tripped is True
-        assert duration == UpstreamCircuitBreaker.DEFAULT_5XX_COOLDOWN == 120.0
+        assert duration == UpstreamCircuitBreaker.DEFAULT_5XX_COOLDOWN == 60.0
         tripped_now, remaining = b.check("https://ep", "m1")
         assert tripped_now is True
-        assert 115.0 <= remaining <= 120.0
+        assert 55.0 <= remaining <= 60.0
 
     def test_success_200_resets_5xx_streak(self):
         b = UpstreamCircuitBreaker()
         for _ in range(4):
             b.note_5xx("https://ep", "m1")
         b.note_success("https://ep", "m1")
-        for _ in range(4):
+        for _ in range(7):
             b.note_5xx("https://ep", "m1")
         assert b.check("https://ep", "m1")[0] is False
-        tripped, _ = b.note_5xx("https://ep", "m1")  # 清零后重新数满 5 次
+        tripped, _ = b.note_5xx("https://ep", "m1")  # 清零后重新数满阈值
         assert tripped is True
 
     def test_snapshot_and_clear(self):
@@ -210,9 +216,9 @@ class TestRateLimiter:
         client = CodeBuddyClient("https://upstream.test", platform="VSCode",
                                  session_file=tmp_path / "session.json")
         state = ProxyState(client=client, mock_dir=tmp_path, log_file=None)
-        assert state.rate_limiter.rate_qps == 1.0
-        assert state.rate_limiter.burst == 5
-        assert state.rate_limiter.jitter == 3.0
+        assert state.rate_limiter.rate_qps == 3.0
+        assert state.rate_limiter.burst == 10
+        assert state.rate_limiter.jitter == 0.5
         assert state.credit_burn_threshold == 0.3
 
 
@@ -406,8 +412,13 @@ SAMPLE_ACCOUNTS = {
 }
 
 
-def _usage_chunk(prompt: int, completion: int, rid: str = "cmb-u1") -> str:
-    return f'data: {json.dumps({"id": rid, "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}], "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}})}'
+def _usage_chunk(prompt: int, completion: int, rid: str = "cmb-u1",
+                 credit: float | None = None) -> str:
+    usage: dict = {"prompt_tokens": prompt, "completion_tokens": completion,
+                   "total_tokens": prompt + completion}
+    if credit is not None:
+        usage["credit"] = credit
+    return f'data: {json.dumps({"id": rid, "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}], "usage": usage})}'
 
 
 # ============================================================================
@@ -487,17 +498,18 @@ class TestCircuitBreakerEndToEnd:
         assert r.status_code == 200
         assert len(harness.captured) == 1
 
-    def test_five_5xx_trips_then_fast_fail(self, harness):
-        harness.script = [{"status": 503, "body": b"upstream blew up"} for _ in range(5)]
-        for _ in range(5):
+    def test_5xx_trips_then_fast_fail(self, harness):
+        """连续 8 次 5xx 后熔断，期间不再打上游。"""
+        harness.script = [{"status": 503, "body": b"upstream blew up"} for _ in range(8)]
+        for _ in range(8):
             r = harness.post(_chat_body("m-5xx"))
             assert r.status_code == 503
-        assert len(harness.captured) == 5
+        assert len(harness.captured) == 8
 
-        r6 = harness.post(_chat_body("m-5xx"))
-        assert r6.status_code == 429
-        assert "熔断中" in r6.json()["detail"]["error"]["message"]
-        assert len(harness.captured) == 5  # 上游无新调用
+        r9 = harness.post(_chat_body("m-5xx"))
+        assert r9.status_code == 429
+        assert "熔断中" in r9.json()["detail"]["error"]["message"]
+        assert len(harness.captured) == 8  # 上游无新调用
 
     def test_200_clears_5xx_streak(self, harness):
         harness.script = (
@@ -608,16 +620,43 @@ class TestCreditsEndpoint:
 
 class TestCreditBurn:
     def test_usage_recorded_in_sliding_window(self, harness):
-        harness.billing = {"status": 403, "text": "forbidden"}  # → 阈值兜底 500
+        """拿不到 credits（国内 403）时按 tokens 与兜底阈值比较。
+
+        曾经的 bug：阈值用 credits × ratio，窗口却累加 tokens，单位不一致；
+        兜底值还是 500 tokens，一次真实请求就爆表。
+        """
+        harness.billing = {"status": 403, "text": "forbidden"}  # → token 兜底阈值
         harness.script = [{"status": 200, "lines": [
             _usage_chunk(400, 300), "data: [DONE]"]}]
         r = harness.post(_chat_body("m-burn"))
         assert r.status_code == 200
-        assert harness.state.burn_window_total() == 700
+        tokens, credits = harness.state.burn_window()
+        assert tokens == 700
+        assert credits == 0.0
 
         data = harness.get("/v1/credits").json()
-        assert data["burn_warning"] is True  # 700 > 500 兜底阈值
-        assert any("credit_burn_warning" in m for m in harness.log_handler.messages)
+        assert data["burn_unit"] == "tokens"
+        assert data["burn_warning"] is False  # 700 远低于兜底阈值
+        assert not any("credit_burn_warning" in m for m in harness.log_handler.messages)
+
+    def test_fallback_threshold_not_triggered_by_normal_use(self, harness):
+        """回归：正常用量不能触发告警。
+
+        旧兜底阈值 500 tokens 时，一次 1 万 token 的真实请求就会报
+        credit_burn_warning，用户误以为网关过于保守。
+        """
+        from codebuddy_proxy import BURN_FALLBACK_TOKENS
+        harness.billing = {"status": 403, "text": "forbidden"}
+        # 模拟 30 次、每次 3 万 token 的重度使用
+        for i in range(30):
+            harness.script = [{"status": 200, "lines": [
+                _usage_chunk(20000, 10000), "data: [DONE]"]}]
+            harness.post(_chat_body(f"m-heavy-{i}"))
+        tokens, _ = harness.state.burn_window()
+        assert tokens == 900_000
+        data = harness.get("/v1/credits").json()
+        assert data["burn_warning"] is False, "重度正常使用不应告警"
+        assert BURN_FALLBACK_TOKENS == 1_000_000
 
     def test_below_threshold_no_warning(self, harness):
         harness.billing = {"status": 403, "text": "forbidden"}
@@ -628,29 +667,50 @@ class TestCreditBurn:
         assert data["burn_warning"] is False
 
     def test_threshold_uses_credits_remain_ratio(self, harness):
+        """有 credits 数据时，窗口与阈值都按 credits 比较（同单位）。"""
         harness.billing = {"status": 200, "json": {"Accounts": [
             {"PackageName": "p", "CapacityRemainPrecise": 1000.0,
              "CapacitySizePrecise": 1000.0, "CycleEndTime": "2026-10-01"}]}}
         data = harness.get("/v1/credits").json()
         assert data["available"] is True
         assert data["total_remain"] == 1000.0
-        # 阈值 = 1000 * 0.3 = 300
+        # 阈值 = 1000 * 0.3 = 300 credits
 
+        # usage 里带 credit 字段（与 total_remain 同单位）
         harness.script = [{"status": 200, "lines": [
-            _usage_chunk(350, 100), "data: [DONE]"]}]
+            _usage_chunk(350, 100, credit=450.0), "data: [DONE]"]}]
         harness.post(_chat_body("m-burn-ratio"))
-        assert harness.state.burn_window_total() == 450
+        tokens, credits = harness.state.burn_window()
+        assert tokens == 450          # tokens 仍照记
+        assert credits == 450.0
 
         data = harness.get("/v1/credits").json()
-        assert data["burn_warning"] is True  # 450 > 300
+        assert data["burn_unit"] == "credits"
+        assert data["burn_warning"] is True  # 450 credits > 300 credits
+
+    def test_credits_present_but_zero_uses_tokens(self, harness):
+        """上游 credit 为 0（免费模型）时应退回 tokens 比较，不能误告警。"""
+        harness.billing = {"status": 200, "json": {"Accounts": [
+            {"PackageName": "p", "CapacityRemainPrecise": 1000.0,
+             "CapacitySizePrecise": 1000.0, "CycleEndTime": "2026-10-01"}]}}
+        harness.script = [{"status": 200, "lines": [
+            _usage_chunk(350, 100, credit=0.0), "data: [DONE]"]}]
+        harness.post(_chat_body("m-burn-zero-credit"))
+        data = harness.get("/v1/credits").json()
+        assert data["burn_unit"] == "tokens"
+        assert data["burn_warning"] is False
 
     def test_window_prunes_events_older_than_10min(self, harness):
-        harness.state._usage_events.append((time.time() - 601, 99999))
-        assert harness.state.burn_window_total() == 0.0
+        harness.state._usage_events.append((time.time() - 601, 99999, 0.0))
+        tokens, credits = harness.state.burn_window()
+        assert tokens == 0.0
+        assert credits == 0.0
 
     def test_collect_without_usage_records_nothing(self, harness):
         harness.post(_chat_body("m-burn-nousage"))  # 默认 [DONE] 无 usage
-        assert harness.state.burn_window_total() == 0.0
+        tokens, credits = harness.state.burn_window()
+        assert tokens == 0.0
+        assert credits == 0.0
 
 
 # ============================================================================
@@ -659,6 +719,8 @@ class TestCreditBurn:
 
 class TestHealthRateLimiter:
     def test_health_includes_rate_limiter(self, harness):
+        # harness 显式放大限速桶（rate_qps=100 / burst=100 / jitter=0），
+        # 避免用例被排队拖慢。默认值由 test_proxy_state_rate_defaults 覆盖。
         data = harness.get("/health").json()
         assert data["status"] == "ok"
         rl = data["rate_limiter"]

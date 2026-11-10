@@ -152,9 +152,9 @@ class ProxyState:
         verbose_llm: bool = False,
         logger: logging.Logger | None = None,
         device_token: str | None = None,
-        rate_qps: float = 1.0,
-        rate_burst: int = 5,
-        rate_jitter: float = 3.0,
+        rate_qps: float = 3.0,
+        rate_burst: int = 10,
+        rate_jitter: float = 0.5,
         credit_burn_threshold: float = 0.3,
     ):
         self.client = client
@@ -172,12 +172,13 @@ class ProxyState:
         self.breaker = UpstreamCircuitBreaker()
         # P2：消耗速率监控——滑动窗口（最近 10 分钟）(timestamp, 估算消耗)
         self.credit_burn_threshold = credit_burn_threshold
-        self._usage_events: deque[tuple[float, float]] = deque()
+        self._usage_events: deque[tuple[float, float, float]] = deque()
         self._credits_total_remain: float | None = None  # 最近一次成功获取的剩余额度
         self._credits_cache: dict[str, Any] | None = None  # {"fetched_at": float, "payload": dict}
         # 云端模型列表缓存（/v3/config）：{"fetched_at": float, "models": list[dict]}
         self._cloud_models_cache: dict[str, Any] | None = None
         self._burn_warned = False
+        self._burn_has_credits = False  # 窗口内是否出现过非零 credit 数据
         # 客户端会话键（body 轻量指纹）→ conversation_id，模拟 IDE 会话链路
         self._conversations: dict[str, str] = {}
         # conv_id → 上一轮上游响应 id（previous_response_id 会话延续）
@@ -245,49 +246,79 @@ class ProxyState:
         self._trace_ids[conv_id] = (trace_id, 1)
         return trace_id
 
-    def _prune_usage(self, now: float | None = None) -> float:
-        """清理 10 分钟窗口外的消耗事件，返回窗口内估算消耗总和。"""
+    def _prune_usage(self, now: float | None = None) -> tuple[float, float]:
+        """清理 10 分钟窗口外的消耗事件，返回 (窗口内 tokens, 窗口内 credits)。"""
         now = time.time() if now is None else now
         cutoff = now - 600
         while self._usage_events and self._usage_events[0][0] < cutoff:
             self._usage_events.popleft()
-        return sum(v for _, v in self._usage_events)
+        tokens = sum(e[1] for e in self._usage_events)
+        credits = sum(e[2] for e in self._usage_events)
+        return tokens, credits
 
     def _burn_threshold(self) -> float:
-        """消耗速率告警阈值：credits 可用时为 total_remain 的比例，否则兜底 500。"""
-        if self._credits_total_remain is not None:
+        """消耗速率告警阈值。
+
+        必须与 window 里的单位一致：
+        - 有 credits 数据时，窗口记 credits，阈值 = total_remain × ratio（同单位）
+        - 否则窗口记 tokens，阈值用 token 单位的兜底值
+
+        曾经的 bug：阈值用 credits × ratio，窗口却累加 tokens，两个单位直接比较。
+        国内版计费接口返回 403（code 10085）拿不到 credits，于是走兜底 500 ——
+        而 500 是 token 数，一次真实请求（大上下文 + 代码）就上万 token，
+        结果一两个请求就报 credit_burn_warning，用户误以为网关"过于保守"。
+        """
+        if self._credits_total_remain is not None and self._burn_has_credits:
             return max(0.0, self._credits_total_remain) * self.credit_burn_threshold
-        return 500.0
+        return float(BURN_FALLBACK_TOKENS)
 
     def record_burn(self, model: str, usage: dict[str, Any] | None) -> None:
-        """记录一次成功上游请求的估算消耗（prompt+completion tokens），只告警不拒绝。"""
+        """记录一次成功上游请求的消耗，只告警不拒绝。
+
+        同时记录 tokens 与 credits：上游 usage 带 credit 字段（与 /v1/credits 的
+        total_remain 同单位）时按 credits 比较，否则退回 tokens。
+        """
         if not isinstance(usage, dict):
             return
         try:
             tokens = int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0)
         except (TypeError, ValueError):
+            tokens = 0
+        try:
+            credits = float(usage.get("credit") or 0)
+        except (TypeError, ValueError):
+            credits = 0.0
+        if tokens <= 0 and credits <= 0:
             return
-        if tokens <= 0:
-            return
+
         now = time.time()
-        self._usage_events.append((now, float(tokens)))
-        window = self._prune_usage(now)
+        self._usage_events.append((now, float(tokens), credits))
+        if credits > 0:
+            self._burn_has_credits = True
+        window_tokens, window_credits = self._prune_usage(now)
         threshold = self._burn_threshold()
+        window = window_credits if (
+            self._credits_total_remain is not None and self._burn_has_credits
+        ) else window_tokens
+
         if window > threshold:
             if not self._burn_warned:
                 self._burn_warned = True
                 diagnostic(
                     "credit_burn_warning",
                     model=model,
-                    window_tokens=window,
+                    window_tokens=round(window_tokens, 1),
+                    window_credits=round(window_credits, 3),
+                    unit="credits" if window is window_credits else "tokens",
                     threshold=round(threshold, 2),
                     credits_available=self._credits_total_remain is not None,
                 )
         else:
             self._burn_warned = False
+        self._burn_has_credits = False  # 窗口内是否出现过非零 credit 数据
 
-    def burn_window_total(self) -> float:
-        """当前 10 分钟滑动窗口内的估算消耗总和。"""
+    def burn_window(self) -> tuple[float, float]:
+        """当前 10 分钟滑动窗口内的 (tokens, credits)。"""
         return self._prune_usage()
 
     def write_log(self, event: str, **kwargs) -> None:
@@ -366,7 +397,7 @@ class RateLimiter:
     rate_qps <= 0 表示不限速（仅抖动）。
     """
 
-    def __init__(self, rate_qps: float = 1.0, burst: int = 5, jitter: float = 3.0):
+    def __init__(self, rate_qps: float = 3.0, burst: int = 10, jitter: float = 0.5):
         self.rate_qps = float(rate_qps)
         self.burst = max(1, int(burst))
         self.jitter = max(0.0, float(jitter))
@@ -420,13 +451,17 @@ class UpstreamCircuitBreaker:
     """上游熔断器：按 (endpoint, model) 二元组独立熔断。
 
     - 429：按 details 中的 reset 时间冷却（中英文文案，UTC+8 解析），解析不出默认 300s
-    - 连续 5 次 5xx：熔断 120s；200 成功清零连续计数
+    - 连续 8 次 5xx：熔断 60s；200 成功清零连续计数
     - 冷却到期惰性恢复（无后台线程）
+
+    阈值取过的教训：曾用「连续 5 次 5xx 熔断 120s」，上游偶发抖动就会把用户
+    挡在门外 2 分钟，反馈「用一会儿就被网关拦」。5xx 更可能是瞬时抖动而非封控，
+    封控的信号是 429/6004，那条路径本来就会按上游 reset 时间冷却。
     """
 
     DEFAULT_429_COOLDOWN = 300.0
-    DEFAULT_5XX_COOLDOWN = 120.0
-    MAX_5XX_STREAK = 5
+    DEFAULT_5XX_COOLDOWN = 60.0
+    MAX_5XX_STREAK = 8
     _RESET_RE = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}:\d{2}")
 
     def __init__(self):
@@ -488,7 +523,7 @@ class UpstreamCircuitBreaker:
         self._streaks.pop(self._key(endpoint, model), None)
 
     def note_5xx(self, endpoint: str, model: str) -> tuple[bool, float]:
-        """5xx 记账：连续第 5 次触发熔断 120 秒。返回 (是否触发熔断, 冷却秒数)。"""
+        """5xx 记账：连续第 MAX_5XX_STREAK 次触发熔断。返回 (是否触发, 冷却秒数)。"""
         key = self._key(endpoint, model)
         streak = self._streaks.get(key, 0) + 1
         self._streaks[key] = streak
@@ -1314,20 +1349,29 @@ async def get_credits(refresh: int = 0):
     data = dict(data)
     data["cached"] = from_cache
 
-    # 消耗速率告警（实时计算；只告警不拒绝）
-    window = state.burn_window_total()
-    if data.get("available") and data.get("total_remain") is not None:
+    # 消耗速率告警（实时计算；只告警不拒绝）。
+    # 有 credits 数据时按 credits 与 total_remain 比较，否则按 tokens 与兜底阈值比较，
+    # 两个单位不能混。
+    window_tokens, window_credits = state.burn_window()
+    if data.get("available") and data.get("total_remain") is not None and window_credits > 0:
+        window = window_credits
         threshold = float(data["total_remain"]) * state.credit_burn_threshold
+        unit = "credits"
     else:
-        threshold = 500.0
+        window = window_tokens
+        threshold = float(BURN_FALLBACK_TOKENS)
+        unit = "tokens"
     data["burn_warning"] = window > threshold
+    data["burn_unit"] = unit
 
     if not data.get("available"):
         # 国内端点 403 等场景：只返回本地已知信息并标注 unavailable
         data["local"] = {
             "endpoint": state.client.endpoint,
             "platform": state.client.platform,
-            "window_burn_tokens": window,
+            "window_burn_tokens": window_tokens,
+            "window_burn_credits": round(window_credits, 3),
+            "burn_unit": unit,
             "burn_threshold": threshold,
             "credit_burn_threshold": state.credit_burn_threshold,
             "window_seconds": 600,
@@ -1616,6 +1660,14 @@ async def forward_chat(
 # 不用来判断「流是否健康」。
 STREAM_MAX_BUFFERED_BYTES = 64 * 1024 * 1024   # 单条流累计行字节上限（内存护栏）
 STREAM_IDLE_READ_S = 300.0                     # 每次读之间的超时（= httpx read）
+
+# 消耗速率告警的兜底阈值（单位：tokens / 10 分钟）。
+# 仅在拿不到上游 credits 时使用（国内计费接口 403 code 10085）。
+# 定这个值的依据：AI 编码会话单次请求常见 1~5 万 token（大 system prompt +
+# 代码上下文），10 分钟窗口内几十次请求约几十万 token。1,000,000 之上才算
+# 异常（比如死循环重试、忘记截断的上下文）。
+# 曾经这里是 500 —— 一次真实请求就爆表，用户误以为网关"过于保守"。
+BURN_FALLBACK_TOKENS = 1_000_000
 
 
 class StreamWatchdogError(Exception):
@@ -2465,14 +2517,16 @@ def main():
                         help="x-device-token：裸 token 值、JSON 文件（extract_device_token.py --output）"
                              "或其路径；也可用 CODEBUDDY_DEVICE_TOKEN 环境变量。"
                              "缺省时尝试自动发现（官方 IDE 下大概率找不到，见 extract 脚本注释）")
-    parser.add_argument("--rate-qps", type=float, default=1.0,
-                        help="全局限速：持续 QPS（令牌桶补充速率，默认 1.0，0 表示不限速）")
-    parser.add_argument("--rate-burst", type=int, default=5,
-                        help="全局限速：突发容量（默认 5，超出部分排队等待）")
-    parser.add_argument("--rate-jitter", type=float, default=3.0,
-                        help="每请求随机抖动上限（秒，默认 3.0，0 关闭）")
+    parser.add_argument("--rate-qps", type=float, default=3.0,
+                        help="全局限速：持续 QPS（令牌桶补充速率，默认 3.0，0 表示不限速）")
+    parser.add_argument("--rate-burst", type=int, default=10,
+                        help="全局限速：突发容量（默认 10，超出部分排队等待）")
+    parser.add_argument("--rate-jitter", type=float, default=0.5,
+                        help="每请求随机抖动上限（秒，默认 0.5，0 关闭）")
     parser.add_argument("--credit-burn-threshold", type=float, default=0.3,
-                        help="消耗速率告警阈值：10 分钟窗口消耗占剩余额度比例（默认 0.3）")
+                        help="消耗速率告警阈值：10 分钟窗口消耗占剩余额度比例（默认 0.3）。"
+                             "拿不到上游 credits 时改用 token 兜底阈值 "
+                             f"{BURN_FALLBACK_TOKENS} tokens/10min")
     args = parser.parse_args()
     
     # 设置日志
