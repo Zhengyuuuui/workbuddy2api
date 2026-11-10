@@ -636,6 +636,29 @@ def _strip_http_framework_noise(request: httpx.Request, platform: str) -> httpx.
     return request
 
 
+def _delta_has_payload(chunk: dict[str, Any]) -> bool:
+    """判断一个上游 chunk 是否携带有效载荷。
+
+    有效载荷包括：
+      - delta.content            正文
+      - delta.reasoning_content  思考过程（reasoning_effort=high 时上游只流这个）
+      - delta.tool_calls         工具调用
+      - chunk.usage              收尾 usage 帧
+
+    只数 content 会把纯思考阶段误判成"上游卡死"。
+    """
+    if chunk.get("usage"):
+        return True
+    choices = chunk.get("choices") or []
+    if not choices:
+        return False
+    delta = choices[0].get("delta") or {}
+    for key in ("content", "reasoning_content", "reasoning", "tool_calls"):
+        if delta.get(key):
+            return True
+    return False
+
+
 def _extract_upstream_response_id(chunk: dict[str, Any]) -> str | None:
     """从上游 SSE data JSON 中提取响应 id（cmb- 前缀，或 responses 协议的 response.id）。
 
@@ -1748,10 +1771,12 @@ async def stream_upstream(
                         continue
                     
                     chunk_count += 1
-                    # 连续空 chunk 计数：有实际内容（或 usage 收尾帧）就归零
-                    has_payload = bool(
-                        ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content")
-                    ) or bool(chunk.get("usage"))
+                    # 连续空 chunk 计数：有实际内容（或 usage 收尾帧）就归零。
+                    # ⚠️ 必须把 reasoning_content 也算有效载荷：客户端发
+                    # reasoning_effort=high 时，上游会先只流思考过程
+                    # （实测难题 + 大上下文可达 500+ chunk 才出正文），
+                    # 只数 content 会把这些请求误判为"上游卡死"而掐断。
+                    has_payload = bool(_delta_has_payload(chunk))
                     empty_chunk_streak = 0 if has_payload else empty_chunk_streak + 1
                     rid = _extract_upstream_response_id(chunk)
                     if rid:

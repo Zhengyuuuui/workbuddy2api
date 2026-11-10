@@ -258,3 +258,80 @@ def test_empty_chunk_streak_resets_on_content(patched):
 
     chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
     assert b"[DONE]" in b"".join(chunks)
+
+
+def _reasoning_chunks(n, with_final_content=True):
+    """模拟 reasoning_effort=high 的上游：先只流 reasoning_content，再给正文。"""
+    lines = [
+        'data: ' + json.dumps({
+            "id": "cmb-test", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {
+                "reasoning_content": f"思考{i}...", "content": "",
+            }, "finish_reason": None}],
+        })
+        for i in range(n)
+    ]
+    if with_final_content:
+        lines.append('data: ' + json.dumps({
+            "id": "cmb-test", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": {"content": "最终答案"},
+                         "finish_reason": None}],
+        }))
+    lines.append("data: [DONE]")
+    return lines
+
+
+def test_long_reasoning_phase_not_treated_as_stall(patched):
+    """回归：reasoning_effort=high 时上游先只流 reasoning_content。
+
+    实测 reasoning 阶段可达 500+ chunk，只数 content 会把请求误判为上游卡死。
+    此前这条路径被看门狗掐断，用户侧表现为「对话一半卡住/失败」。
+    """
+    patched.sent["response"] = _FakeResponse(
+        _reasoning_chunks(STREAM_MAX_EMPTY_CHUNKS + 200)
+    )
+
+    async def run():
+        agen = proxy.stream_upstream(
+            "https://copilot.tencent.com/v2/chat/completions",
+            {}, {"model": "deepseek-v4.1-flash", "messages": [],
+                 "reasoning_effort": "high"}, "openai", None,
+        )
+        return await _drain(agen)
+
+    chunks = asyncio.run(asyncio.wait_for(run(), timeout=60))
+    joined = b"".join(chunks)
+    assert b"stalled" not in joined, "长思考阶段被误判为上游卡死"
+    assert b"[DONE]" in joined
+
+
+def test_delta_has_payload_counts_reasoning():
+    """_delta_has_payload 必须把 reasoning_content 视为有效载荷。"""
+    from codebuddy_proxy import _delta_has_payload
+
+    assert _delta_has_payload({"choices": [{"delta": {"content": "x"}}]})
+    assert _delta_has_payload({"choices": [{"delta": {"reasoning_content": "想"}}]})
+    assert _delta_has_payload({"choices": [{"delta": {"reasoning": "想"}}]})
+    assert _delta_has_payload({"choices": [{"delta": {"tool_calls": [{"id": "1"}]}}]})
+    assert _delta_has_payload({"usage": {"total_tokens": 1}})
+    assert not _delta_has_payload({"choices": [{"delta": {"content": ""}}]})
+    assert not _delta_has_payload({"choices": [{"delta": {}}]})
+    assert not _delta_has_payload({"choices": []})
+    assert not _delta_has_payload({})
+
+
+def test_truly_empty_stream_still_trips(patched):
+    """真正全空的流（无 content 也无 reasoning）仍必须被看门狗掐断。"""
+    patched.sent["response"] = _FakeResponse(
+        _endless_empty_chunks(STREAM_MAX_EMPTY_CHUNKS + 50)
+    )
+
+    async def run():
+        agen = proxy.stream_upstream(
+            "https://copilot.tencent.com/v2/chat/completions",
+            {}, {"model": "hy3", "messages": []}, "openai", None,
+        )
+        return await _drain(agen)
+
+    chunks = asyncio.run(asyncio.wait_for(run(), timeout=30))
+    assert b"stalled" in b"".join(chunks)
