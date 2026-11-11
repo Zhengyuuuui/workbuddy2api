@@ -79,6 +79,11 @@ CDATA_END = "]]>"
 COMMENT_START = "<!--"
 COMMENT_END = "-->"
 
+# 流式缓冲里，为等待一个可能未闭合的标签最多扣住多少字节。
+# 真实工具调用标签都在几百字节内；超过这个值说明上游只是在发普通文本
+# （比如代码里的 '<'），继续扣着会导致内容无限滞留、流结束时被丢掉。
+MAX_PENDING_TAG_BYTES = 4096
+
 
 # ============================================================================
 # 忽略区域检测
@@ -774,9 +779,10 @@ class ToolCallStreamBuffer:
                         self.calls_emitted = True
                         
                         prefix = self.buffer[:tag.start]
-                        suffix = self.buffer[close_tag.end + 1:]
-                        
-                        self.buffer = ""
+                        # suffix 是工具调用块之后的内容，必须留在 buffer 里继续
+                        # 处理。曾经这里写 self.buffer = ""，把 suffix 整个丢掉，
+                        # 导致工具调用之后的所有正文永久丢失（长任务输出被截断）。
+                        self.buffer = self.buffer[close_tag.end + 1:]
                         
                         return prefix.strip(), calls
                 else:
@@ -804,9 +810,10 @@ class ToolCallStreamBuffer:
                         self.calls_emitted = True
                         
                         prefix = self.buffer[:tag.start]
-                        suffix = self.buffer[close_tag.end + 1:]
-                        
-                        self.buffer = ""
+                        # suffix 是工具调用块之后的内容，必须留在 buffer 里继续
+                        # 处理。曾经这里写 self.buffer = ""，把 suffix 整个丢掉，
+                        # 导致工具调用之后的所有正文永久丢失（长任务输出被截断）。
+                        self.buffer = self.buffer[close_tag.end + 1:]
                         
                         return prefix.strip(), calls
                 else:
@@ -817,11 +824,39 @@ class ToolCallStreamBuffer:
         
         # 如果 buffer 中没有任何 < 字符，可以安全输出
         if '<' in self.buffer:
-            return "", None
-        
+            # ⚠️ 不能因为有 '<' 就扣住整个 buffer：代码里的泛型（Foo<T>）、
+            # HTML、比较运算符（a < b）都含 '<'，全扣住会导致长输出被截断——
+            # 流结束时若没 flush，这些内容永久丢失。
+            #
+            # 正确做法：只扣住**末尾可能构成未闭合标签的那一段**，
+            # 其余安全内容立即输出。判定方式：取最后一个 '<'，若它到末尾
+            # 之间没有 '>'，说明这个标签还没闭合，可能是在等的工具调用；
+            # 若有 '>'，说明该段已完整但不是工具调用，可以安全输出。
+            last_lt = self.buffer.rfind('<')
+            tail = self.buffer[last_lt:]
+            if '>' not in tail:
+                safe = self.buffer[:last_lt]
+                self.buffer = tail
+                # 防呆：tail 无限增长（上游一直发 '<' 不给 '>'）时不能无限扣，
+                # 超过阈值得当普通文本放行，否则 buffer 会无限膨胀。
+                if len(tail) > MAX_PENDING_TAG_BYTES:
+                    self.buffer = ""
+                    return safe + tail, None
+                return safe, None
+
         output = self.buffer
         self.buffer = ""
         return output, None
+
+    def flush(self) -> str:
+        """流结束时调用：吐出 buffer 里剩余的内容。
+
+        没有这个方法的话，任何滞留在 buffer 里的内容（未闭合标签、代码里的
+        '<' 之后的文本）都会在流结束时永久丢失，表现为「长输出被截断」。
+        """
+        remaining = self.buffer
+        self.buffer = ""
+        return remaining
     
     def should_emit_tool_calls(self) -> bool:
         """是否应该发送 tool_calls"""

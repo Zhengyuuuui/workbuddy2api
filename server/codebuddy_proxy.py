@@ -1943,6 +1943,36 @@ async def stream_upstream(
                         for event_name, event_data in events:
                             yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
                 
+                # 把 DSML 缓冲区里滞留的内容补发出去。
+                # 缓冲区为了等完整的工具调用标签会扣住末尾内容，流结束时若不
+                # flush，这些内容（未闭合标签、代码里的 '<' 之后的文本）就永久
+                # 丢失——表现为「长任务输出被截断」，且每个客户端都会中招。
+                tail_text = dsml_buffer.flush()
+                if tail_text:
+                    response_text += tail_text
+                    if protocol == "openai":
+                        chunk = {
+                            "id": "chatcmpl-" + uuid.uuid4().hex,
+                            "object": "chat.completion.chunk",
+                            "created": now_s(),
+                            "model": body.get("model", ""),
+                            "choices": [{"index": 0, "delta": {"content": tail_text},
+                                         "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode()
+                    elif protocol == "anthropic" and anthropic_state:
+                        for event_name, event_data in anthropic_state.feed_chunk({
+                            "choices": [{"index": 0, "delta": {"content": tail_text},
+                                         "finish_reason": None}]
+                        }):
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+                    elif protocol == "responses" and responses_state:
+                        for event_name, event_data in responses_state.feed_chunk({
+                            "choices": [{"index": 0, "delta": {"content": tail_text},
+                                         "finish_reason": None}]
+                        }):
+                            yield f"event: {event_name}\ndata: {json.dumps(event_data, ensure_ascii=False)}\n\n".encode()
+
                 # 发送结束事件。finish_emitted 保证整个流只结束一次：
                 # 正常路径结束后若 aclose()/尾部读取再抛 TransportError，
                 # 下面的恢复分支不会重复补发 completed（ResponsesStreamConverter
@@ -2328,6 +2358,12 @@ async def collect_upstream(
                                     tool_calls_dict[idx]["function"]["name"] = tc["function"]["name"]
                                 if tc.get("function", {}).get("arguments"):
                                     tool_calls_dict[idx]["function"]["arguments"] += tc.get("function", {}).get("arguments")
+
+                        # 缓冲区滞留内容（未闭合标签、代码里的 '<' 之后的文本）
+                        # 必须补回来，否则非流式响应会丢尾巴。
+                        tail_text = dsml_buffer.flush()
+                        if tail_text:
+                            content += tail_text
 
             finally:
                 await resp.aclose()
