@@ -923,6 +923,105 @@ async def health():
     }
 
 
+# ---------------------------------------------------------------------------
+# 模型上下文档位
+#
+# 为什么要在 /v1/models 里暴露：客户端（AI 编码编辑器）大多带硬编码的模型元数据表，
+# 表里没有我们的模型时就 fallback 到一个保守默认值（opencode 是 128000），然后
+# **在发请求之前**就把上下文截断到那个值——我们的 bridge 明明支持 100 万也收不到。
+#
+# 查找优先级（每个字段独立）：上游 /v3/config 声明 > 本表 > 默认。
+# 未知 context 一律给 1_000_000：宁可高估，低估会让客户端提前截断上下文。
+# 未知 output 则省略该字段，避免客户端按错误的值限制生成长度。
+# ---------------------------------------------------------------------------
+DEFAULT_CONTEXT_TOKENS = 1_000_000
+
+# (context, output)；数据来自上游 /v3/config 的 maxInputTokens/maxOutputTokens，
+# 个别上游未声明的用实测值（见 README「模型列表」）。
+MODEL_CONTEXT_TABLE: dict[str, tuple[int, int | None]] = {
+    # --- 100 万档 ---
+    "glm-5.3": (1_000_000, 131_072),
+    "glm-5.3-flash": (1_000_000, 131_072),
+    "glm-5.3-flashx": (1_000_000, 131_072),
+    "glm-5.2": (1_000_000, 131_072),
+    "glm-5.1": (1_000_000, 131_072),
+    "kimi-k3-1": (1_000_000, 1_048_576),
+    "kimi-k3.1-pro": (1_000_000, 32_000),
+    "kimi-k2.8-preview": (1_000_000, 131_072),
+    "minimax-m3.1-flash": (1_000_000, 128_000),
+    "mimo-v2.6-pro": (1_000_000, 128_000),
+    "deepseek-v4-pro": (1_000_000, 393_216),
+    "deepseek-v4-flash": (1_000_000, 50_000),
+    "deepseek-v4.1-flash": (1_000_000, 393_216),
+    "deepseek-v4.1-flash-sg": (1_000_000, 393_216),
+    "hy4free": (1_000_000, 64_000),
+    "hy4std": (1_000_000, 64_000),
+    "step-5-preview": (1_000_000, 64_000),
+    "space-bunny": (1_000_000, 128_000),
+    # 上游未声明档位，实测 30 万+ 通过；与同族 hy4free/hy4std 对齐
+    "hy4-preview": (1_000_000, 64_000),
+    "hy4-preview-f": (1_000_000, 64_000),
+    # --- 低档位 ---
+    "auto": (256_000, 32_000),
+    "hy3": (192_000, 64_000),
+    "hy3-x": (192_000, 64_000),
+    "codewise-default-model-v2": (96_000, 32_000),
+}
+
+
+def _resolve_context_limits(model_id: str,
+                            remote: tuple[int | None, int | None] = (None, None)
+                            ) -> tuple[int, int | None]:
+    """解析模型的 (context, output)。
+
+    remote 是上游 /v3/config 声明的 (maxInputTokens, maxOutputTokens)，优先使用。
+    """
+    remote_ctx, remote_out = remote
+    try:
+        remote_ctx = int(remote_ctx or 0)
+    except (TypeError, ValueError):
+        remote_ctx = 0
+    try:
+        remote_out = int(remote_out or 0)
+    except (TypeError, ValueError):
+        remote_out = 0
+
+    table_ctx, table_out = MODEL_CONTEXT_TABLE.get(model_id, (0, 0))
+    context = remote_ctx or table_ctx or DEFAULT_CONTEXT_TOKENS
+    output = remote_out or table_out or None
+    return context, output
+
+
+def _model_limits_payload(model_id: str,
+                          remote: tuple[int | None, int | None] = (None, None)
+                          ) -> dict[str, Any]:
+    """构造 /v1/models 单条模型的上限字段。
+
+    同一个值发多个别名：不同客户端读的键名不一（OpenAI 官方用
+    context_length，OpenRouter 系用 context_window/max_input_tokens，
+    另有客户端读 max_completion_tokens）。宁可多发，不可漏发。
+    """
+    context, output = _resolve_context_limits(model_id, remote)
+    payload: dict[str, Any] = {
+        "context_length": context,
+        "max_input_tokens": context,
+        # OpenRouter 形状的块，部分多 provider 客户端只读这里
+        "context_window": context,
+        "top_provider": {"context_length": context},
+        "architecture": {
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "modality": "text->text",
+        },
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+    }
+    if output:
+        payload["max_output_tokens"] = output
+        payload["max_completion_tokens"] = output
+    return payload
+
+
 def _guess_vendor(model_id: str) -> str:
     """按 id 前缀猜测厂商（上游 /v3/config 的 vendor 是 e/f/j/i 等档位码，
     不是厂商名，无法直接用于 owned_by，故沿用本文件的命名风格推断）。"""
@@ -989,6 +1088,17 @@ _CREDIT_SUFFIX_RE = re.compile(r"\s*\(\s*x\s*[0-9]+(?:\.[0-9]+)?\s*\)\s*$", re.I
 _CONTEXT_TAG_RE = re.compile(r"\s*\[\s*\d+\s*[kKmM]\s*\]\s*$")
 
 
+def _context_tag(context: int) -> str:
+    """把 context token 数格式化成客户端认的短标记：1000000 -> '1M'。"""
+    if not context:
+        return ""
+    if context >= 1_000_000:
+        return f"{context // 1_000_000}M"
+    if context >= 1_000:
+        return f"{context // 1_000}k"
+    return str(context)
+
+
 def _decorate_model_id(model_id: str, rate: float | None) -> str:
     """给 /v1/models 里返回的 id 附上倍率：'fast-model' -> 'fast-model (x0.34)'。
 
@@ -1003,13 +1113,21 @@ def _normalize_model_id(model: Any) -> Any:
     """把客户端回传的展示用模型名还原成上游真 id。
 
     客户端（cc-switch / Claude Code 等）会把 /v1/models 里的 id 原样回传，
-    因此可能带上我们附加的倍率后缀 " (x0.34)"，也可能带上下文标记 "[1M]"。
-    两者上游都不认识，需在转发前剥掉；非字符串或没有后缀时原样返回。
+    因此可能带上我们附加的倍率后缀 " (x0.34)"，也可能带上下文标记 "[1M]"，
+    甚至两者叠加成 "fast-model (x0.34)[1M]"。两者上游都不认识，需在转发前剥掉；
+    非字符串或没有后缀时原样返回。
+
+    必须循环剥到稳定：两个后缀的先后顺序不固定，单次 sub 只能剥掉末尾那个。
     """
     if not isinstance(model, str) or not model:
         return model
-    cleaned = _CREDIT_SUFFIX_RE.sub("", model)
-    cleaned = _CONTEXT_TAG_RE.sub("", cleaned).strip()
+    cleaned = model
+    for _ in range(4):  # 后缀最多两层，4 次足够且防死循环
+        stripped = _CREDIT_SUFFIX_RE.sub("", cleaned)
+        stripped = _CONTEXT_TAG_RE.sub("", stripped).strip()
+        if stripped == cleaned:
+            break
+        cleaned = stripped
     return cleaned or model
 
 
@@ -1067,6 +1185,9 @@ async def _fetch_cloud_models(state: ProxyState) -> list[dict[str, Any]] | None:
             "vendor": _guess_vendor(str(mid)),
             # 原始倍率单独给一份，方便客户端自行排序/过滤，不依赖名字解析
             "credit_rate": rate,
+            # 上游声明的上下文档位，/v1/models 会优先采用
+            "max_input_tokens": m.get("maxInputTokens"),
+            "max_output_tokens": m.get("maxOutputTokens"),
         })
     return out or None
 
@@ -1218,9 +1339,25 @@ async def list_models(refresh: int = 0):
             "name": m.get("name", m["id"]),
             # 上游 credits 倍率（海外 /v3/config 实时列表才有；国内/快照为 None）
             "credit_rate": m.get("credit_rate"),
+            # 上下文档位。客户端拿不到可靠值时会在发请求前自行截断上下文
+            # （opencode 对未知模型 fallback 128000），所以这里必须给准，
+            # 且未知时给高估值而非低估值。
+            **_model_limits_payload(
+                _normalize_model_id(m["id"]),
+                (m.get("max_input_tokens"), m.get("max_output_tokens")),
+            ),
         }
         for m in models
     ]
+
+    # 在展示 id / name 末尾附上下文标记（如 "hy4-preview-f[1M]"）。
+    # cc-switch / Claude Code 等只展示 id 的客户端靠这个才能看出档位；
+    # 转发时 _normalize_model_id() 会剥掉，上游不受影响。
+    for item in data:
+        tag = _context_tag(item.get("context_length") or 0)
+        if tag:
+            item["id"] = f"{item['id']}[{tag}]"
+            item["name"] = f"{item['name']} [{tag}]"
 
     return {"object": "list", "data": data}
 

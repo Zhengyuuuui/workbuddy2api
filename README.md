@@ -286,6 +286,55 @@ model_provider = "codebuddy"
 
 > 模型列表会随平台更新变化，以 `GET /v1/models` 的实际返回为准。
 
+### 上下文档位（`/v1/models`）
+
+`/v1/models` 会带上每个模型的 context / output 上限，同一值发多个别名以兼容不同客户端：
+
+```jsonc
+{
+  "id": "hy4-preview-f[1M]",              // 展示 id 也带档位标记
+  "name": "Hy4 preview [1M]",
+  "context_length": 1000000,              // OpenAI 官方字段名
+  "max_input_tokens": 1000000,
+  "context_window": 1000000,              // OpenRouter 形状
+  "top_provider": {"context_length": 1000000},
+  "max_output_tokens": 64000,
+  "max_completion_tokens": 64000,
+  "input_modalities": ["text"],
+  "output_modalities": ["text"],
+  "credit_rate": null
+}
+```
+
+查找优先级（每个字段独立）：**上游 `/v3/config` 声明 > 内置表 > 默认值**。
+
+- **未知 context 一律给 `1_000_000`** —— 宁可高估。低估会让客户端在发请求前就
+  截断上下文（opencode 对未登记模型 fallback 到 128000），我们的 bridge 明明支持
+  100 万也收不到请求。
+- **未知 output 则省略该字段**，避免客户端按错误的值限制生成长度。
+
+海外版走实时 `/v3/config`，能拿到上游真实声明（如 `default-model` 176k、
+`max-model` 272k）；国内版用内置表。
+
+**各档位分布**（国内版）：
+
+| 档位 | 模型 |
+|---|---|
+| 1M | `deepseek-v4-pro` `deepseek-v4-flash` `deepseek-v4.1-flash` `glm-5.3` `glm-5.3-flash` `glm-5.3-flashx` `glm-5.2` `glm-5.1` `kimi-k3-1` `kimi-k3.1-pro` `kimi-k2.8-preview` `minimax-m3.1-flash` `mimo-v2.6-pro` `hy4free` `hy4std` `step-5-preview` `space-bunny` `hy4-preview` `hy4-preview-f` |
+| 256K | `auto` |
+| 192K | `hy3` `hy3-x` |
+| 96K | `codewise-default-model-v2` |
+
+> ⚠️ **客户端侧的限制**：AI 编码编辑器多带硬编码模型元数据表，表里没有我们的模型时
+> 会 fallback 到保守默认值，然后在**发请求前**截断上下文。bridge 本身不设任何
+> 上下文/消息数上限（实测透传 96.9 万 token）。如果客户端仍截断，需要在客户端配置里
+> 显式声明，例如 opencode 的 `opencode.json`：
+> ```jsonc
+> "provider": { "codebuddy": { "models": {
+>   "deepseek-v4.1-flash": { "limit": {"context": 1000000, "output": 393216} }
+> }}}
+> ```
+
 #### 海外版 id 带 credits 倍率
 
 海外版 `/v1/models` 实时同步上游 `/v3/config`（缓存 10 分钟，`?refresh=1` 强制刷新），
