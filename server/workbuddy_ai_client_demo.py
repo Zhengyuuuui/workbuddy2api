@@ -16,6 +16,7 @@ with 0600 permissions.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import pathlib
@@ -243,11 +244,36 @@ class WorkBuddyAIClient:
         self._save_session({**self.session, "auth": payload})
         return True
 
+    @staticmethod
+    def _token_exp_ms(token: Any) -> int:
+        """从 JWT 的 exp claim 解析过期时间（epoch 毫秒），解析不出返回 0。
+
+        上游刷新响应不返回 expiresAt 字段，不能因「字段缺失」就认为永不过期。
+        """
+        if not isinstance(token, str):
+            return 0
+        parts = token.split(".")
+        if len(parts) != 3:
+            return 0
+        try:
+            payload = parts[1]
+            payload += "=" * (-len(payload) % 4)
+            claims = json.loads(base64.urlsafe_b64decode(payload))
+            exp = claims.get("exp")
+            return int(exp * 1000) if isinstance(exp, (int, float)) else 0
+        except (ValueError, TypeError, KeyError):
+            return 0
+
     def ensure_authenticated(self, *, open_browser: bool = True) -> None:
         auth = self.session.get("auth") or {}
         now_ms = int(time.time() * 1000)
         expires_at = int(auth.get("expiresAt") or 0)
-        if auth.get("accessToken") and (not expires_at or expires_at > now_ms + 60_000):
+        # ⚠️ 上游刷新响应不含 expiresAt，绝不能因为「字段缺失」就认为永不过期——
+        # 那会导致 token 过期后仍继续使用，被网关以 401 拒绝，且现象是
+        # 「突然全部不可用」。兜底从 JWT 的 exp claim 解析真实过期时间。
+        if not expires_at:
+            expires_at = self._token_exp_ms(auth.get("accessToken"))
+        if auth.get("accessToken") and expires_at > now_ms + 60_000:
             return
         if self.refresh():
             print("access token 已刷新")
