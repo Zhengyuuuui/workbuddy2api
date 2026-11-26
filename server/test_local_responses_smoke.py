@@ -9,6 +9,7 @@
 注：8787/8788 已被占用，本用例走 TestClient 进程内调用，不占端口。
 """
 import json
+import pathlib
 
 import httpx
 import pytest
@@ -17,6 +18,11 @@ from fastapi.testclient import TestClient
 import codebuddy_proxy
 from codebuddy_client_demo import CodeBuddyClient
 from codebuddy_proxy import ProxyState
+from responses_adapter import (
+    ResponsesStreamConverter,
+    _convert_tools_for_chat,
+    responses_request_to_chat,
+)
 
 GOOD = 'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}'
 
@@ -160,3 +166,176 @@ def test_responses_stream_false_is_json(client):
     assert payload["status"] == "completed"
     # 归一化发生在转发前，上游收到的必须是真 id
     assert captured["body"]["model"] == "fast-model"
+
+
+# --- 6) 回归锁定：Responses 事件必须满足官方 schema ------------------------
+
+def _all_events() -> list[tuple[str, dict]]:
+    """文本 + 工具调用两类路径的事件全集。"""
+    conv = ResponsesStreamConverter("deepseek-v4.1-flash")
+    evs = conv.feed_chunk({
+        "choices": [{"delta": {"content": "hi"}}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+    })
+    evs += conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+        {"index": 0, "id": "fc1",
+         "function": {"name": "shell", "arguments": "{}"}}]}}]})
+    evs += conv.finish()
+    return evs
+
+
+def test_every_event_has_sequence_number():
+    """Codex 的 Rust 解析器要求每个事件都带 sequence_number；Claude Code
+    容错缺失，所以该缺陷只在 Codex 路径暴露（stream closed before completed）。"""
+    for name, payload in _all_events():
+        assert "sequence_number" in payload, f"{name} 缺 sequence_number"
+
+
+def test_sequence_numbers_are_contiguous_from_zero():
+    seqs = [p["sequence_number"] for _, p in _all_events()]
+    assert seqs == list(range(len(seqs))), f"sequence_number 不连续: {seqs}"
+
+
+def test_response_object_is_responses_api_not_realtime():
+    """object 必须是 "response"。早期版本误用 Realtime API 的
+    "realtime.response"，在 Responses API 里是非法枚举值。"""
+    for name, payload in _all_events():
+        resp = payload.get("response")
+        if resp is not None:
+            assert resp["object"] == "response", f"{name}: object={resp['object']!r}"
+
+
+def test_completed_carries_model_and_output():
+    conv = ResponsesStreamConverter("deepseek-v4.1-flash")
+    conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+    events = dict(conv.finish())
+    resp = events["response.completed"]["response"]
+    assert resp["model"] == "deepseek-v4.1-flash"
+    assert resp["status"] == "completed"
+    assert resp["output"], "completed.response.output 不应为空"
+    # usage.input_tokens_details 必须有 cache_write_tokens（官方必填）
+    details = resp["usage"]["input_tokens_details"]
+    assert "cache_write_tokens" in details
+
+
+def test_content_part_type_is_output_text():
+    """part.type 官方取值为 output_text，不是 text。"""
+    conv = ResponsesStreamConverter("m")
+    evs = conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+    added = dict(evs)["response.content_part.added"]
+    assert added["part"]["type"] == "output_text"
+    # content_part.* 需要 item_id / output_index / content_index
+    for field in ("item_id", "output_index", "content_index"):
+        assert field in added, f"content_part.added 缺 {field}"
+
+
+def test_output_item_added_has_output_index_and_status():
+    conv = ResponsesStreamConverter("m")
+    evs = conv.feed_chunk({"choices": [{"delta": {"content": "hi"}}]})
+    added = dict(evs)["response.output_item.added"]
+    assert added["output_index"] == 0
+    assert added["item"]["status"] == "in_progress"
+
+
+def test_function_call_output_index_follows_index():
+    """多工具调用时 output_index 必须跟随 call.index，不能硬编码 0。"""
+    conv = ResponsesStreamConverter("m")
+    evs = conv.feed_chunk({"choices": [{"delta": {"tool_calls": [
+        {"index": 2, "id": "fc2", "function": {"name": "b", "arguments": "{}"}}]}}]})
+    delta = dict(evs)["response.function_call_arguments.delta"]
+    assert delta["output_index"] == 2
+
+
+# --- 7) 回归锁定：Codex 的 Responses 工具必须过滤掉 chat 不认的类型 --------
+
+def test_namespace_tools_are_dropped():
+    """Codex (wire_api=responses) 会发 namespace 类型工具，它没有 parameters。
+    转成空 schema 的 function 会让上游以 code 11129
+    'invalid function call parameters' 拒绝整个请求 Codex 侧表现为
+    stream closed before response.completed。"""
+    tools = [
+        {"type": "function", "name": "shell",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+        {"type": "namespace", "name": "mcp__node_repl",
+         "description": "...", "tools": [{"name": "js"}]},
+    ]
+    out = _convert_tools_for_chat(tools)
+    assert [t["function"]["name"] for t in out] == ["shell"]
+
+
+def test_web_search_tool_is_dropped():
+    tools = [
+        {"type": "function", "name": "shell",
+         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}},
+        {"type": "web_search", "external_web_access": True},
+    ]
+    out = _convert_tools_for_chat(tools)
+    assert [t["function"]["name"] for t in out] == ["shell"]
+
+
+def test_empty_parameters_is_dropped():
+    """空 properties 的 function 工具同样会被上游拒。"""
+    tools = [{"type": "function", "name": "noop",
+              "parameters": {"type": "object", "properties": {}}}]
+    assert _convert_tools_for_chat(tools) == []
+
+
+def test_chat_format_tool_is_validated_not_passed_through():
+    """已是 chat 格式的工具也要校验 parameters，不能再原样透传。"""
+    tools = [{"type": "function",
+              "function": {"name": "noop", "parameters": {"type": "object", "properties": {}}}}]
+    assert _convert_tools_for_chat(tools) == []
+
+
+def test_all_tools_filtered_out_yields_empty_list():
+    tools = [{"type": "namespace", "name": "ns"}, {"type": "web_search"}]
+    assert _convert_tools_for_chat(tools) == []
+
+
+def test_all_tools_filtered_out_omits_tools_key():
+    """全被过滤时不应再发 tools: [] —— 空数组对上游无意义。"""
+    body = {"model": "m", "stream": True, "input": "hi",
+            "tools": [{"type": "namespace", "name": "ns"}, {"type": "web_search"}]}
+    chat = responses_request_to_chat(body)
+    assert "tools" not in chat
+
+
+def test_surviving_tools_are_kept_when_some_filtered():
+    body = {"model": "m", "stream": True, "input": "hi", "tools": [
+        {"type": "function", "name": "shell",
+         "parameters": {"type": "object", "properties": {"c": {"type": "string"}}}},
+        {"type": "namespace", "name": "ns"},
+    ]}
+    chat = responses_request_to_chat(body)
+    assert [t["function"]["name"] for t in chat["tools"]] == ["shell"]
+
+
+def test_real_codex_request_converts_to_valid_chat_body():
+    """端到端：Codex 真实请求体经 responses_request_to_chat 后，
+    所有 tools 都必须是带非空 properties 的 function。
+
+    只取带 tools 的 dump（目录里可能混有自测用的无 tools 请求）。
+    """
+    dump = pathlib.Path("logs/req-dump")
+    samples = sorted(dump.glob("req-*.json")) if dump.exists() else []
+    bodies = []
+    for f in samples:
+        try:
+            b = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if b.get("tools"):
+            bodies.append(b)
+    if not bodies:
+        pytest.skip("无 Codex 请求 dump（CODEBUDDY_DUMP_REQ=1 时才会生成）")
+    body = bodies[0]
+    chat = responses_request_to_chat(body)
+    tools = chat.get("tools") or []
+    assert tools, "过滤后 tools 不应为空（Codex 有 16 个工具）"
+    for t in tools:
+        assert t["type"] == "function"
+        assert t["function"]["parameters"].get("properties"), t["function"]["name"]
+    # 16 个原始工具里 5 个非 function，应被过滤
+    assert len(tools) < len(body["tools"]), "非 function 工具应被过滤掉"
+
+
